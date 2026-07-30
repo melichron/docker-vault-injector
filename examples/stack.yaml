@@ -39,7 +39,7 @@ services:
         # With no .env.* labels, all top-level scalar fields are imported
         # using their Vault keys as environment variable names.
         io.github.docker-vault-injector.secrets.database.name: "db-vars"
-        io.github.docker-vault-injector.secrets.database.kv: "kv"
+        io.github.docker-vault-injector.secrets.database.kv: "approle-accessed-kv"
         io.github.docker-vault-injector.secrets.database.vault-path: "apps/example/database"
       update_config:
         order: start-first
