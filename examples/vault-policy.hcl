@@ -8,3 +8,13 @@ path "kv/data/apps/*" {
   capabilities = ["read"]
 }
 
+# These endpoints let the controller verify and renew the service token issued
+# by AppRole. Vault's default policy normally grants them, but keeping them
+# explicit makes this policy work if the role configuration changes later.
+path "auth/token/lookup-self" {
+  capabilities = ["read"]
+}
+
+path "auth/token/renew-self" {
+  capabilities = ["update"]
+}

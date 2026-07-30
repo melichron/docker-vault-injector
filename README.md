@@ -1,65 +1,72 @@
 # docker-vault-injector
 
-Небольшой reconciliation-controller для Docker Swarm. Он читает конфигурацию из labels сервиса, получает значения из HashiCorp Vault KV v2 и добавляет их в `ServiceSpec.TaskTemplate.ContainerSpec.Env`. При изменении секрета контроллер обновляет сервис, а Swarm выполняет обычный rolling update его задач.
+A small reconciliation controller for Docker Swarm. It reads configuration from service labels, retrieves values from HashiCorp Vault KV v2, and adds them to `ServiceSpec.TaskTemplate.ContainerSpec.Env`. When a secret changes, the controller updates the service and Swarm performs a regular rolling update of its tasks.
 
-Проект ориентирован и на полноценные кластеры, и на single-node Swarm. Одиночный Swarm можно создать одной командой:
+The project supports both multi-node clusters and single-node Swarm installations. A single-node Swarm can be initialized with one command:
 
 ```bash
 docker swarm init
 ```
 
-## Текущий статус
+## Current status
 
-Это понятный, рабочий каркас MVP, а не законченный production-релиз. Уже реализованы:
+This is a straightforward, functional MVP rather than a finished production release. It currently provides:
 
-- Docker service event stream для быстрой реакции на создание и изменение сервисов;
-- периодический полный resync на случай пропущенных событий;
-- чтение metadata и конкретной версии Vault KV v2;
-- несколько Vault-документов для одного сервиса;
-- вложенные поля вроде `connection.host`;
-- optimistic locking через Docker `Version.Index`;
-- сохранение всех не принадлежащих контроллеру полей `ServiceSpec`;
-- обнаружение ручного изменения уже внедрённых environment variables;
-- удаление старых managed variables при изменении mapping;
-- очистка внедрённых variables при `enabled: "false"`;
-- отсутствие значений секретов в логах контроллера;
-- unit-тесты основных сценариев.
+- a Docker service event stream for reacting quickly to service creation and updates;
+- periodic full reconciliation in case events are missed;
+- Vault KV v2 metadata reads followed by reads of an exact secret version;
+- AppRole login through an explicitly configured auth mount path;
+- periodic token validation through `lookup-self`;
+- `renew-self` before token expiration and a new AppRole login after revocation or expiry;
+- multiple Vault documents per service;
+- automatic import of flat Vault documents without listing individual variables;
+- optional explicit mappings, including nested fields such as `connection.host`;
+- environment variable collision detection across sources;
+- optimistic locking through Docker `Version.Index`;
+- preservation of all `ServiceSpec` fields not owned by the controller;
+- detection of manual changes to injected environment variables;
+- removal of obsolete managed variables when mappings change;
+- removal of injected variables when `enabled: "false"`;
+- no secret values in controller logs;
+- unit tests for the main scenarios.
 
-Пока не реализованы AppRole login, автоматическое продление Vault token, leader election для нескольких экземпляров контроллера, metrics/health endpoint и полноценные end-to-end тесты.
+Response-wrapped SecretID delivery, leader election for multiple controller replicas, metrics and health endpoints, and full end-to-end tests are not implemented yet.
 
-## Как это работает
+## How it works
 
 ```text
-Docker service create/update event       Периодический timer
+Docker service create/update event        Periodic timer
                  │                              │
                  └──────────┬───────────────────┘
                             ▼
                    inspect Swarm Service
                             │
-                   прочитать deploy.labels
+                    read deploy.labels
                             │
-              получить current_version из Vault
+               read current_version from Vault
                             │
-                  версия и state hash прежние?
+          versions, config hash, and state hash match?
                      ┌──────┴──────┐
-                    да            нет
+                    yes            no
                      │              │
-                  ничего     прочитать точные версии
+                  no-op       read exact versions
                                     │
-                              построить Env
+                              construct Env
                                     │
                              ServiceUpdate
                                     │
                             Swarm rolling update
 ```
 
-Контроллер сначала читает `current_version` из metadata. Если необходимо обновление, он запрашивает именно эту версию через `GetVersion`. Это исключает гонку, когда между чтением metadata и данных в Vault появляется ещё одна версия.
+The controller first reads `current_version` from Vault metadata. If an update is required, it requests that exact version through `GetVersion`. This prevents a race where a new Vault version appears between the metadata and data requests.
 
-Помимо версии хранится SHA-256 hash управляемой части environment. Он позволяет заметить ручное изменение `DB_PASSWORD` в Docker ServiceSpec, даже если версия Vault не менялась. Hash не считается границей безопасности: пользователь, способный прочитать service labels, обычно может прочитать и `ServiceSpec.Env`.
+In addition to versions, the controller stores SHA-256 hashes of the source configuration and the managed portion of the environment. The configuration hash detects label changes even when Vault version numbers happen to match. The state hash detects manual changes to values such as `DB_PASSWORD` in Docker `ServiceSpec`. These hashes are not a security boundary: a user who can read service labels can generally read `ServiceSpec.Env` as well.
 
-## Labels сервиса
+## Service labels
 
-Labels должны находиться именно в `deploy.labels`. Обычный блок `labels` создаёт labels контейнеров, а контроллер наблюдает Swarm Services.
+Labels must be placed under `deploy.labels`. A regular `labels` block creates container labels, while this controller watches Swarm Services.
+
+The common case is a single flat Vault document. No multiline JSON label is needed:
 
 ```yaml
 services:
@@ -68,43 +75,70 @@ services:
     deploy:
       labels:
         io.github.docker-vault-injector.enabled: "true"
-        io.github.docker-vault-injector.secrets: |
-          {
-            "database": {
-              "mount": "kv",
-              "path": "apps/api/database",
-              "env": {
-                "DB_USER": "username",
-                "DB_PASSWORD": "password"
-              }
-            },
-            "redis": {
-              "mount": "kv",
-              "path": "apps/api/redis",
-              "env": {
-                "REDIS_PASSWORD": "credentials.password"
-              }
-            }
-          }
+        io.github.docker-vault-injector.secrets.common.name: "common-vars"
+        io.github.docker-vault-injector.secrets.common.kv: "docker-swarm-secrets"
+        io.github.docker-vault-injector.secrets.common.vault-path: "stage/backend/common"
 ```
 
-`mount` — имя mount point KV v2 без `/data/` или `/metadata/`. `path` — логический путь внутри mount. В примере физические API endpoints будут `kv/metadata/apps/api/database` и `kv/data/apps/api/database`.
+If that path contains:
 
-Имена верхнего уровня (`database`, `redis`) произвольны, но должны быть уникальны. Одна environment variable не может принадлежать двум источникам одновременно. В environment допускаются только скалярные Vault-значения: строки, числа и boolean. Объекты и массивы намеренно отклоняются.
+```json
+{
+  "FIRST_ENV": "value",
+  "SECOND_ENV": "another_value",
+  "PORT": 8080
+}
+```
 
-Контроллер самостоятельно добавляет labels:
+the controller adds `FIRST_ENV=value`, `SECOND_ENV=another_value`, and `PORT=8080`. When a source has no `.env.*` labels, every top-level scalar field is imported under its original name.
+
+Multiple sources are expressed as multiple label groups:
+
+```yaml
+deploy:
+  labels:
+    io.github.docker-vault-injector.enabled: "true"
+    io.github.docker-vault-injector.secrets.common.name: "common-vars"
+    io.github.docker-vault-injector.secrets.common.kv: "docker-swarm-secrets"
+    io.github.docker-vault-injector.secrets.common.vault-path: "stage/backend/common"
+    io.github.docker-vault-injector.secrets.database.name: "db-vars"
+    io.github.docker-vault-injector.secrets.database.kv: "docker-db-secrets"
+    io.github.docker-vault-injector.secrets.database.vault-path: "stage/backend/db-conns"
+```
+
+`common` and `database` are arbitrary unique group identifiers. `name` is a required, human-readable name that must be unique across sources. `kv` is the name of the KV v2 mount point without `/data/` or `/metadata/`; `vault-path` is the logical path within that mount.
+
+Add an explicit mapping when you need selective imports, renaming, or access to a nested field. The presence of at least one `.env.*` label switches that source from automatic import to selective import:
+
+```yaml
+deploy:
+  labels:
+    io.github.docker-vault-injector.enabled: "true"
+    io.github.docker-vault-injector.secrets.database.name: "db-vars"
+    io.github.docker-vault-injector.secrets.database.kv: "kv"
+    io.github.docker-vault-injector.secrets.database.vault-path: "apps/api/database"
+    io.github.docker-vault-injector.secrets.database.env.DB_USER: "username"
+    io.github.docker-vault-injector.secrets.database.env.DB_HOST: "connection.host"
+```
+
+The suffix after `.env.` is the target Docker environment variable name, while the label value is the path to a field in the Vault document. The controller does not impose shell naming conventions; operators are responsible for deciding whether unusual names are appropriate. Only empty names and names containing `=` are rejected because Docker stores entries as `NAME=value`.
+
+An environment variable may be owned by only one source, including variables discovered through automatic import. A collision rejects the entire reconciliation before the service is changed. Environment values may be strings, numbers, or booleans. Automatic import rejects top-level objects, arrays, and `null`; a nested scalar can instead be selected with an explicit mapping.
+
+The controller adds these state labels itself:
 
 ```text
 io.github.docker-vault-injector.applied-versions
 io.github.docker-vault-injector.managed-env
 io.github.docker-vault-injector.state-hash
+io.github.docker-vault-injector.config-hash
 ```
 
-Их не следует редактировать вручную. Значений секретов в этих labels нет.
+Do not edit them manually. They do not contain secret values.
 
-## Отключение
+## Disabling injection
 
-Чтобы контроллер удалил ранее внедрённые variables, установите:
+To remove variables previously injected by the controller, set:
 
 ```yaml
 deploy:
@@ -112,11 +146,11 @@ deploy:
     io.github.docker-vault-injector.enabled: "false"
 ```
 
-На следующем reconcile контроллер удалит variables из `managed-env`, очистит свои state labels и обновит сервис. После завершения cleanup labels можно удалить полностью.
+On the next reconciliation, the controller removes the variables listed in `managed-env`, clears its state labels, and updates the service. After cleanup has completed, all injector labels may be removed.
 
-## Требования Vault
+## Vault requirements
 
-Поддерживается только KV v2. Минимальная policy находится в [examples/vault-policy.hcl](examples/vault-policy.hcl):
+Only KV v2 is supported. A minimal policy is provided in [examples/vault-policy.hcl](examples/vault-policy.hcl):
 
 ```hcl
 path "kv/metadata/apps/*" {
@@ -126,17 +160,29 @@ path "kv/metadata/apps/*" {
 path "kv/data/apps/*" {
   capabilities = ["read"]
 }
+
+path "auth/token/lookup-self" {
+  capabilities = ["read"]
+}
+
+path "auth/token/renew-self" {
+  capabilities = ["update"]
+}
 ```
 
-Пример данных:
+A complete example for creating a custom auth mount, policy, AppRole, RoleID, and SecretID is available in [examples/setup-approle.md](examples/setup-approle.md).
+
+Example data:
 
 ```bash
 vault kv put -mount=kv apps/example/database \
-  username=example \
-  password=change-me
+  DB_USER=example \
+  DB_PASSWORD=change-me \
+  DB_HOST=db.internal \
+  DB_PORT=5432
 ```
 
-Для вложенного объекта удобнее использовать JSON:
+Explicit `.env.*` mappings can also select fields from nested JSON:
 
 ```bash
 vault kv put -mount=kv apps/example/database @database.json
@@ -153,24 +199,34 @@ vault kv put -mount=kv apps/example/database @database.json
 }
 ```
 
-## Конфигурация процесса
+## Process configuration
 
-Стандартные variables официального Vault Go client поддерживаются: `VAULT_ADDR`, `VAULT_CACERT`, `VAULT_CAPATH`, `VAULT_CLIENT_CERT`, `VAULT_CLIENT_KEY`, `VAULT_NAMESPACE` и proxy variables.
+The standard environment variables supported by the official Vault Go client are available, including `VAULT_ADDR`, `VAULT_CACERT`, `VAULT_CAPATH`, `VAULT_CLIENT_CERT`, `VAULT_CLIENT_KEY`, `VAULT_NAMESPACE`, and proxy variables.
 
-| Variable | Default | Назначение |
+| Variable | Default | Purpose |
 |---|---:|---|
-| `VAULT_TOKEN` | — | Vault token непосредственно в environment |
-| `VAULT_TOKEN_FILE` | — | Файл с Vault token; имеет приоритет над `VAULT_TOKEN` |
-| `INJECTOR_POLL_INTERVAL` | `30s` | Интервал полного resync |
-| `INJECTOR_RECONCILE_TIMEOUT` | `20s` | Timeout одного Docker/Vault reconcile |
-| `INJECTOR_EVENT_RETRY_INTERVAL` | `5s` | Задержка перед переподключением к Docker events |
-| `INJECTOR_LOG_LEVEL` | `info` | `debug`, `info`, `warn` или `error` |
+| `VAULT_AUTH_METHOD` | `approle` | `approle`, or the explicit `token` fallback |
+| `VAULT_APPROLE_AUTH_PATH` | — | Required full mount path, for example `auth/docker-swarm`, without `/login` |
+| `VAULT_APPROLE_ROLE_ID` | — | RoleID supplied directly through the environment |
+| `VAULT_APPROLE_ROLE_ID_FILE` | — | File containing RoleID; takes precedence over the environment |
+| `VAULT_APPROLE_SECRET_ID` | — | SecretID supplied directly through the environment |
+| `VAULT_APPROLE_SECRET_ID_FILE` | — | File containing SecretID; takes precedence over the environment |
+| `VAULT_TOKEN_CHECK_INTERVAL` | `30s` | Interval between AppRole token checks through `lookup-self` |
+| `VAULT_AUTH_RETRY_INTERVAL` | `5s` | Delay between failed AppRole login attempts |
+| `VAULT_TOKEN` | — | Static token used when `VAULT_AUTH_METHOD=token` |
+| `VAULT_TOKEN_FILE` | — | File containing a static token; takes precedence over `VAULT_TOKEN` |
+| `INJECTOR_POLL_INTERVAL` | `30s` | Full reconciliation interval |
+| `INJECTOR_RECONCILE_TIMEOUT` | `20s` | Timeout for one Docker/Vault reconciliation |
+| `INJECTOR_EVENT_RETRY_INTERVAL` | `5s` | Delay before reconnecting to Docker events |
+| `INJECTOR_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, or `error` |
 
-Token читается при запуске и пока автоматически не обновляется. Для MVP используйте периодически возобновляемый token с минимальной policy и перезапускайте injector при его замене. AppRole/auto-auth — логичное следующее расширение.
+In AppRole mode, the initial login completes before the reconciliation controller starts. The injector then checks the token on schedule, renews it after roughly two-thirds of its issued TTL, and performs a new AppRole login if the token is revoked, expired, non-renewable, or cannot be renewed. RoleID and SecretID files are read again on every login.
 
-## Сборка и тесты
+The `token` mode remains available for development and emergency diagnostics. It validates the static token at startup but intentionally does not manage its lifecycle.
 
-Требуется Go 1.26 или новее.
+## Building and testing
+
+Go 1.26 or newer is required.
 
 ```bash
 make test
@@ -178,13 +234,13 @@ make vet
 make build
 ```
 
-Сборка контейнера:
+To build the container image:
 
 ```bash
 make docker-build
 ```
 
-Если module path будущего GitHub-репозитория отличается от указанного в `go.mod`, замените его до первой публикации:
+If the future GitHub repository uses a module path different from the one in `go.mod`, change it before the first release:
 
 ```bash
 go mod edit -module github.com/OWNER/docker-vault-injector
@@ -192,22 +248,23 @@ rg -l 'github.com/vyktory/docker-vault-injector' --glob '*.go' \
   | xargs sed -i 's#github.com/vyktory/docker-vault-injector#github.com/OWNER/docker-vault-injector#g'
 ```
 
-## Запуск в Swarm
+## Running in Swarm
 
-Сначала создайте token как Docker Secret:
+First create an AppRole and two Docker Secrets using [examples/setup-approle.md](examples/setup-approle.md):
 
 ```bash
-printf '%s' "$VAULT_TOKEN" | docker secret create vault_injector_token -
+docker secret create vault_approle_role_id role-id.txt
+docker secret create vault_approle_secret_id secret-id.txt
 ```
 
-Соберите image и разверните пример:
+Build the image and deploy the example:
 
 ```bash
 docker build -t docker-vault-injector:dev .
 docker stack deploy -c examples/stack.yaml vault-injector-demo
 ```
 
-Injector должен работать на manager node, потому что Service API является manager API. В примере это обеспечивается placement constraint:
+The injector must run on a manager node because the Service API is a manager API. The example enforces this with a placement constraint:
 
 ```yaml
 deploy:
@@ -217,44 +274,44 @@ deploy:
       - node.role==manager
 ```
 
-Проверьте результат:
+Inspect the result:
 
 ```bash
 docker service inspect vault-injector-demo_example \
   --format '{{json .Spec.TaskTemplate.ContainerSpec.Env}}'
 ```
 
-После записи новой версии:
+After writing a new version:
 
 ```bash
-vault kv patch -mount=kv apps/example/database password=new-password
+vault kv patch -mount=kv apps/example/database DB_PASSWORD=new-password
 ```
 
-контроллер заметит новый `current_version`, изменит environment и Swarm заменит task сервиса.
+the controller notices the new `current_version`, changes the environment, and Swarm replaces the service task.
 
-## Поведение при ошибках
+## Error behavior
 
-Fail-safe правило проекта: **никогда не заменять рабочие значения пустыми из-за ошибки Vault или конфигурации**.
+The project's fail-safe rule is: **never replace working values with empty values because of a Vault or configuration error**.
 
-Если Vault недоступен, версия удалена, field отсутствует или mapping некорректен, ServiceSpec остаётся без изменений, а ошибка записывается в лог без secret values. Следующий Docker event или периодический resync повторит попытку.
+If Vault is unavailable, a version has been deleted, a field is missing, or a mapping is invalid, `ServiceSpec` remains unchanged and the error is logged without secret values. The next Docker event or periodic reconciliation retries the operation.
 
-Если между `ServiceInspect` и `ServiceUpdate` другой процесс изменил сервис, Docker отклонит устаревший `Version.Index`. Контроллер не перезаписывает более новое состояние; следующий event/resync выполнит reconcile заново.
+If another process changes the service between `ServiceInspect` and `ServiceUpdate`, Docker rejects the stale `Version.Index`. The controller does not overwrite newer state; the next event or reconciliation starts again from a fresh inspection.
 
-## Взаимодействие с `docker stack deploy`
+## Interaction with `docker stack deploy`
 
-Повторный `docker stack deploy` может убрать environment и state labels, добавленные контроллером, потому что их нет в исходном stack YAML. Injector восстановит их после service update event. Это может вызвать второй rolling update сразу после rollout самого stack deploy.
+Running `docker stack deploy` again may remove environment variables and state labels added by the controller because they are not present in the original stack YAML. The injector restores them after the service update event. This may cause a second rolling update immediately after the rollout initiated by `docker stack deploy`.
 
-Для MVP такое eventual-consistency поведение считается допустимым. Если потребуется ровно один rollout, понадобится отдельный deploy wrapper/preprocessor, а это другой scope.
+This eventual-consistency behavior is acceptable for the MVP. Guaranteeing exactly one rollout would require a separate deployment wrapper or preprocessor, which is outside this project's scope.
 
-## Безопасность
+## Security
 
-Контейнер имеет доступ к `/var/run/docker.sock`, то есть фактически обладает административными правами на Docker host/Swarm. Запускайте только доверенный image и не публикуйте Docker API наружу без TLS.
+The container has access to `/var/run/docker.sock`, which effectively grants administrative control over the Docker host and Swarm. Run only trusted images, and never expose the Docker API externally without TLS.
 
-Секреты находятся в `ServiceSpec.Env` и видны через `docker service inspect` пользователям с правами управления Swarm. Это сознательная модель проекта: тот же пользователь способен выполнить команду внутри task-контейнера и прочитать его environment.
+Secrets are stored in `ServiceSpec.Env` and are visible through `docker service inspect` to users who can manage the Swarm. This is an intentional part of the threat model: the same user can execute a command inside a task container and read its environment.
 
-Контроллер никогда не пишет secret values в собственные логи. Не включайте их в labels и не используйте значения секретов в именах Vault paths.
+The controller never writes secret values to its own logs. Do not place secrets in labels or use secret values as part of Vault path names.
 
-## Структура проекта
+## Project structure
 
 ```text
 cmd/docker-vault-injector/   wiring, signals, process lifecycle
@@ -267,4 +324,4 @@ internal/vaultclient/        thin official Vault client adapter
 examples/                    Swarm stack and Vault policy
 ```
 
-Подробные договорённости для будущих разработчиков и coding agents находятся в [AGENTS.md](AGENTS.md).
+Detailed conventions for future developers and coding agents are documented in [AGENTS.md](AGENTS.md).

@@ -5,11 +5,17 @@ services:
     image: docker-vault-injector:dev
     environment:
       VAULT_ADDR: "https://vault.example.com:8200"
-      VAULT_TOKEN_FILE: "/run/secrets/vault_injector_token"
+      VAULT_AUTH_METHOD: "approle"
+      # This is the full Vault API mount path, but without the /login suffix.
+      VAULT_APPROLE_AUTH_PATH: "auth/docker-swarm"
+      VAULT_APPROLE_ROLE_ID_FILE: "/run/secrets/vault_approle_role_id"
+      VAULT_APPROLE_SECRET_ID_FILE: "/run/secrets/vault_approle_secret_id"
+      VAULT_TOKEN_CHECK_INTERVAL: "30s"
       INJECTOR_POLL_INTERVAL: "30s"
       INJECTOR_LOG_LEVEL: "info"
     secrets:
-      - vault_injector_token
+      - vault_approle_role_id
+      - vault_approle_secret_id
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     deploy:
@@ -30,24 +36,18 @@ services:
       replicas: 1
       labels:
         io.github.docker-vault-injector.enabled: "true"
-        io.github.docker-vault-injector.secrets: |
-          {
-            "database": {
-              "mount": "kv",
-              "path": "apps/example/database",
-              "env": {
-                "DB_USER": "username",
-                "DB_PASSWORD": "password",
-                "DB_HOST": "connection.host",
-                "DB_PORT": "connection.port"
-              }
-            }
-          }
+        # With no .env.* labels, all top-level scalar fields are imported
+        # using their Vault keys as environment variable names.
+        io.github.docker-vault-injector.secrets.database.name: "db-vars"
+        io.github.docker-vault-injector.secrets.database.kv: "kv"
+        io.github.docker-vault-injector.secrets.database.vault-path: "apps/example/database"
       update_config:
         order: start-first
         parallelism: 1
         failure_action: rollback
 
 secrets:
-  vault_injector_token:
+  vault_approle_role_id:
+    external: true
+  vault_approle_secret_id:
     external: true

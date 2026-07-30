@@ -5,4 +5,4 @@ coverage.out
 Dockerfile*
 README.md
 AGENTS.md
-
+tmp/*

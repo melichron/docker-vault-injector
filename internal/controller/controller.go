@@ -198,7 +198,10 @@ func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service
 	if err != nil {
 		return err
 	}
-	desiredNames := configuration.DesiredEnvironmentNames()
+	configurationHash, err := labels.ConfigHash(configuration)
+	if err != nil {
+		return err
+	}
 
 	currentVersions := make(map[string]int, len(configuration.Secrets))
 	sourceNames := sortedSourceNames(configuration.Secrets)
@@ -211,15 +214,20 @@ func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service
 		currentVersions[sourceName] = version
 	}
 
-	currentManagedValues := environment.Select(service.Spec.TaskTemplate.ContainerSpec.Env, desiredNames)
+	// In automatic-import mode the desired environment names live in Vault,
+	// not in service labels. The names recorded by the previous successful
+	// reconciliation are therefore the only names we can use for this cheap
+	// drift check without reading the secret data again.
+	currentManagedValues := environment.Select(service.Spec.TaskTemplate.ContainerSpec.Env, previouslyManaged)
 	stateIsCurrent := maps.Equal(currentVersions, appliedVersions) &&
-		slices.Equal(desiredNames, previouslyManaged) &&
+		service.Spec.Labels[labels.ConfigHashLabel] == configurationHash &&
 		environment.Hash(currentManagedValues) == service.Spec.Labels[labels.StateHashLabel]
 	if stateIsCurrent {
 		return nil
 	}
 
-	desiredValues := make(map[string]string, len(desiredNames))
+	desiredValues := make(map[string]string)
+	environmentOwners := make(map[string]string)
 	for _, sourceName := range sourceNames {
 		source := configuration.Secrets[sourceName]
 		version := currentVersions[sourceName]
@@ -231,14 +239,39 @@ func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service
 			return fmt.Errorf("secret source %q: requested version %d but Vault returned version %d", sourceName, version, secret.Version)
 		}
 
-		for environmentName, fieldPath := range source.Env {
+		if len(source.Env) == 0 {
+			if len(secret.Data) == 0 {
+				return fmt.Errorf("secret source %q: automatic import cannot import an empty Vault document", sourceName)
+			}
+			fieldNames := sortedFieldNames(secret.Data)
+			for _, fieldName := range fieldNames {
+				if err := validateDockerEnvironmentName(fieldName); err != nil {
+					return fmt.Errorf("secret source %q: top-level field %q: %w", sourceName, fieldName, err)
+				}
+				value, err := stringifyScalar(secret.Data[fieldName], fmt.Sprintf("top-level field %q", fieldName))
+				if err != nil {
+					return fmt.Errorf("secret source %q: %w", sourceName, err)
+				}
+				if err := addDesiredEnvironment(desiredValues, environmentOwners, fieldName, value, sourceName); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+
+		environmentNames := sortedMappingNames(source.Env)
+		for _, environmentName := range environmentNames {
+			fieldPath := source.Env[environmentName]
 			value, err := resolveField(secret.Data, fieldPath)
 			if err != nil {
 				return fmt.Errorf("secret source %q, environment %s: %w", sourceName, environmentName, err)
 			}
-			desiredValues[environmentName] = value
+			if err := addDesiredEnvironment(desiredValues, environmentOwners, environmentName, value, sourceName); err != nil {
+				return err
+			}
 		}
 	}
+	desiredNames := sortedMappingNames(desiredValues)
 
 	updated := cloneServiceForUpdate(service)
 	updated.Spec.TaskTemplate.ContainerSpec.Env = environment.Merge(
@@ -254,6 +287,7 @@ func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service
 	updated.Spec.Labels[labels.AppliedVersionsLabel] = versionsJSON
 	updated.Spec.Labels[labels.ManagedEnvLabel] = managedJSON
 	updated.Spec.Labels[labels.StateHashLabel] = environment.Hash(desiredValues)
+	updated.Spec.Labels[labels.ConfigHashLabel] = configurationHash
 
 	if slices.Equal(service.Spec.TaskTemplate.ContainerSpec.Env, updated.Spec.TaskTemplate.ContainerSpec.Env) &&
 		maps.Equal(service.Spec.Labels, updated.Spec.Labels) {
@@ -292,6 +326,7 @@ func (c *Controller) removeManagedEnvironment(ctx context.Context, service swarm
 	delete(updated.Spec.Labels, labels.AppliedVersionsLabel)
 	delete(updated.Spec.Labels, labels.ManagedEnvLabel)
 	delete(updated.Spec.Labels, labels.StateHashLabel)
+	delete(updated.Spec.Labels, labels.ConfigHashLabel)
 
 	if err := c.docker.UpdateService(ctx, updated); err != nil {
 		return err
@@ -337,6 +372,13 @@ func resolveField(data map[string]any, fieldPath string) (string, error) {
 		}
 	}
 
+	return stringifyScalar(current, fmt.Sprintf("field path %q", fieldPath))
+}
+
+// stringifyScalar deliberately refuses objects, arrays and null. Docker
+// environment entries are strings, so silently JSON-encoding a structured
+// value would hide a likely configuration mistake.
+func stringifyScalar(current any, description string) (string, error) {
 	switch value := current.(type) {
 	case string:
 		return value, nil
@@ -344,14 +386,55 @@ func resolveField(data map[string]any, fieldPath string) (string, error) {
 		uint, uint8, uint16, uint32, uint64, json.Number:
 		encoded, err := json.Marshal(value)
 		if err != nil {
-			return "", fmt.Errorf("encode scalar field %q: %w", fieldPath, err)
+			return "", fmt.Errorf("encode scalar %s: %w", description, err)
 		}
 		return string(encoded), nil
 	case nil:
-		return "", fmt.Errorf("field path %q resolves to null", fieldPath)
+		return "", fmt.Errorf("%s resolves to null", description)
 	default:
-		return "", fmt.Errorf("field path %q resolves to an object or array; only scalar values can become environment variables", fieldPath)
+		return "", fmt.Errorf("%s resolves to an object or array; only scalar values can become environment variables", description)
 	}
+}
+
+func addDesiredEnvironment(values, owners map[string]string, name, value, sourceName string) error {
+	if previousSource, duplicate := owners[name]; duplicate {
+		return fmt.Errorf("environment variable %q is produced by both secret source %q and %q", name, previousSource, sourceName)
+	}
+	owners[name] = sourceName
+	values[name] = value
+	return nil
+}
+
+// Docker represents environment entries as NAME=value. We intentionally do
+// not impose shell naming conventions here: dashes, dots and other unusual
+// names are an operator choice. Empty names and '=' are structurally
+// impossible to represent unambiguously and are the only restrictions.
+func validateDockerEnvironmentName(name string) error {
+	if name == "" {
+		return fmt.Errorf("environment variable name cannot be empty")
+	}
+	if strings.Contains(name, "=") {
+		return fmt.Errorf("environment variable name cannot contain '='")
+	}
+	return nil
+}
+
+func sortedFieldNames(fields map[string]any) []string {
+	result := make([]string, 0, len(fields))
+	for name := range fields {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func sortedMappingNames[T any](mapping map[string]T) []string {
+	result := make([]string, 0, len(mapping))
+	for name := range mapping {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func sortedSourceNames(sources map[string]labels.SecretSource) []string {

@@ -14,8 +14,24 @@ type Config struct {
 	PollInterval       time.Duration
 	ReconcileTimeout   time.Duration
 	EventRetryInterval time.Duration
-	VaultTokenFile     string
+	VaultAuth          VaultAuthConfig
 	LogLevel           slog.Level
+}
+
+// VaultAuthConfig contains authentication settings only. The Vault address,
+// namespace and TLS settings continue to use the standard VAULT_* variables
+// understood by HashiCorp's official Go client.
+type VaultAuthConfig struct {
+	Method              string
+	AppRoleAuthPath     string
+	AppRoleRoleID       string
+	AppRoleRoleIDFile   string
+	AppRoleSecretID     string
+	AppRoleSecretIDFile string
+	Token               string
+	TokenFile           string
+	TokenCheckInterval  time.Duration
+	AuthRetryInterval   time.Duration
 }
 
 func Load() (Config, error) {
@@ -28,6 +44,14 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	eventRetryInterval, err := durationFromEnvironment("INJECTOR_EVENT_RETRY_INTERVAL", 5*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	tokenCheckInterval, err := durationFromEnvironment("VAULT_TOKEN_CHECK_INTERVAL", 30*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	authRetryInterval, err := durationFromEnvironment("VAULT_AUTH_RETRY_INTERVAL", 5*time.Second)
 	if err != nil {
 		return Config{}, err
 	}
@@ -45,16 +69,39 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("INJECTOR_LOG_LEVEL must be debug, info, warn, or error")
 	}
 
-	if pollInterval <= 0 || reconcileTimeout <= 0 || eventRetryInterval <= 0 {
+	if pollInterval <= 0 || reconcileTimeout <= 0 || eventRetryInterval <= 0 ||
+		tokenCheckInterval <= 0 || authRetryInterval <= 0 {
 		return Config{}, fmt.Errorf("all duration settings must be greater than zero")
+	}
+
+	authMethod := strings.ToLower(strings.TrimSpace(os.Getenv("VAULT_AUTH_METHOD")))
+	if authMethod == "" {
+		authMethod = "approle"
+	}
+	if authMethod != "approle" && authMethod != "token" {
+		return Config{}, fmt.Errorf("VAULT_AUTH_METHOD must be approle or token")
+	}
+	if authMethod == "approle" && strings.TrimSpace(os.Getenv("VAULT_APPROLE_AUTH_PATH")) == "" {
+		return Config{}, fmt.Errorf("VAULT_APPROLE_AUTH_PATH is required for AppRole authentication")
 	}
 
 	return Config{
 		PollInterval:       pollInterval,
 		ReconcileTimeout:   reconcileTimeout,
 		EventRetryInterval: eventRetryInterval,
-		VaultTokenFile:     os.Getenv("VAULT_TOKEN_FILE"),
-		LogLevel:           level,
+		VaultAuth: VaultAuthConfig{
+			Method:              authMethod,
+			AppRoleAuthPath:     os.Getenv("VAULT_APPROLE_AUTH_PATH"),
+			AppRoleRoleID:       os.Getenv("VAULT_APPROLE_ROLE_ID"),
+			AppRoleRoleIDFile:   os.Getenv("VAULT_APPROLE_ROLE_ID_FILE"),
+			AppRoleSecretID:     os.Getenv("VAULT_APPROLE_SECRET_ID"),
+			AppRoleSecretIDFile: os.Getenv("VAULT_APPROLE_SECRET_ID_FILE"),
+			Token:               os.Getenv("VAULT_TOKEN"),
+			TokenFile:           os.Getenv("VAULT_TOKEN_FILE"),
+			TokenCheckInterval:  tokenCheckInterval,
+			AuthRetryInterval:   authRetryInterval,
+		},
+		LogLevel: level,
 	}, nil
 }
 

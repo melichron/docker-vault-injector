@@ -1,29 +1,35 @@
 // Package labels owns the public label contract between a Swarm service and
 // docker-vault-injector.
 //
-// Keeping all label names and JSON parsing here is intentional. The controller
-// should reason about a typed Config, not about loosely structured strings.
+// User configuration is deliberately spread across ordinary scalar labels.
+// Large JSON/YAML block labels are awkward to template, merge and override in
+// deployment systems. A source named "database" therefore looks like:
+//
+//	io.github.docker-vault-injector.secrets.database.name
+//	io.github.docker-vault-injector.secrets.database.kv
+//	io.github.docker-vault-injector.secrets.database.vault-path
 package labels
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 const (
 	Prefix = "io.github.docker-vault-injector"
 
 	EnabledLabel         = Prefix + ".enabled"
-	SecretsLabel         = Prefix + ".secrets"
+	SecretsPrefix        = Prefix + ".secrets."
 	AppliedVersionsLabel = Prefix + ".applied-versions"
 	ManagedEnvLabel      = Prefix + ".managed-env"
 	StateHashLabel       = Prefix + ".state-hash"
+	ConfigHashLabel      = Prefix + ".config-hash"
 )
-
-var environmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // Config is the user-controlled portion of the service configuration.
 type Config struct {
@@ -31,16 +37,19 @@ type Config struct {
 	Secrets map[string]SecretSource
 }
 
-// SecretSource describes one Vault KV v2 document and how fields from that
-// document map to process environment variables.
+// SecretSource describes one Vault KV v2 document. An empty Env map means
+// "import every top-level scalar field under its original name". A non-empty
+// map means "import only these explicit environment -> Vault field mappings".
 type SecretSource struct {
+	Name  string            `json:"name"`
 	Mount string            `json:"mount"`
 	Path  string            `json:"path"`
-	Env   map[string]string `json:"env"`
+	Env   map[string]string `json:"env,omitempty"`
 }
 
-// ParseConfig reads user-controlled labels. Unknown labels are ignored so new
-// controller versions can add state without breaking older versions.
+// ParseConfig groups flat labels by the source segment between `secrets.` and
+// the property name. Unknown properties are rejected: a typo in `vault-path`
+// should fail safely instead of silently reading the wrong configuration.
 func ParseConfig(serviceLabels map[string]string) (Config, error) {
 	result := Config{}
 
@@ -58,60 +67,91 @@ func ParseConfig(serviceLabels map[string]string) (Config, error) {
 		return result, nil
 	}
 
-	rawSecrets := serviceLabels[SecretsLabel]
-	if rawSecrets == "" {
-		return Config{}, fmt.Errorf("%s is required when injection is enabled", SecretsLabel)
-	}
-	if err := json.Unmarshal([]byte(rawSecrets), &result.Secrets); err != nil {
-		return Config{}, fmt.Errorf("parse %s as JSON: %w", SecretsLabel, err)
-	}
-	if len(result.Secrets) == 0 {
-		return Config{}, fmt.Errorf("%s must contain at least one secret", SecretsLabel)
+	result.Secrets = make(map[string]SecretSource)
+	for labelName, value := range serviceLabels {
+		if !strings.HasPrefix(labelName, SecretsPrefix) {
+			continue
+		}
+
+		remainder := strings.TrimPrefix(labelName, SecretsPrefix)
+		sourceID, property, found := strings.Cut(remainder, ".")
+		if !found || sourceID == "" || property == "" {
+			return Config{}, fmt.Errorf("invalid secret label %q: expected %s<SOURCE>.<PROPERTY>", labelName, SecretsPrefix)
+		}
+
+		source := result.Secrets[sourceID]
+		switch {
+		case property == "name":
+			source.Name = strings.TrimSpace(value)
+		case property == "kv":
+			source.Mount = strings.TrimSpace(value)
+		case property == "vault-path":
+			source.Path = strings.TrimSpace(value)
+		case strings.HasPrefix(property, "env."):
+			environmentName := strings.TrimPrefix(property, "env.")
+			if environmentName == "" {
+				return Config{}, fmt.Errorf("secret source %q has an empty environment variable name", sourceID)
+			}
+			if strings.Contains(environmentName, "=") {
+				return Config{}, fmt.Errorf("secret source %q environment name %q cannot contain '='", sourceID, environmentName)
+			}
+			fieldPath := strings.TrimSpace(value)
+			if fieldPath == "" {
+				return Config{}, fmt.Errorf("secret source %q: Vault field path for %q cannot be empty", sourceID, environmentName)
+			}
+			if source.Env == nil {
+				source.Env = make(map[string]string)
+			}
+			source.Env[environmentName] = fieldPath
+		default:
+			return Config{}, fmt.Errorf("secret source %q has unknown property %q", sourceID, property)
+		}
+		result.Secrets[sourceID] = source
 	}
 
-	seenEnvironment := make(map[string]string)
-	for name, secret := range result.Secrets {
-		if name == "" {
-			return Config{}, fmt.Errorf("secret source name cannot be empty")
+	if len(result.Secrets) == 0 {
+		return Config{}, fmt.Errorf("enabled service must define at least one label under %s", SecretsPrefix)
+	}
+
+	seenNames := make(map[string]string)
+	seenExplicitEnvironment := make(map[string]string)
+	for sourceID, source := range result.Secrets {
+		if source.Name == "" {
+			return Config{}, fmt.Errorf("secret source %q: name is required", sourceID)
 		}
-		if secret.Mount == "" {
-			return Config{}, fmt.Errorf("secret %q: mount is required", name)
+		if source.Mount == "" {
+			return Config{}, fmt.Errorf("secret source %q: kv is required", sourceID)
 		}
-		if secret.Path == "" {
-			return Config{}, fmt.Errorf("secret %q: path is required", name)
+		if source.Path == "" {
+			return Config{}, fmt.Errorf("secret source %q: vault-path is required", sourceID)
 		}
-		if len(secret.Env) == 0 {
-			return Config{}, fmt.Errorf("secret %q: env mapping cannot be empty", name)
+		if previous, duplicate := seenNames[source.Name]; duplicate {
+			return Config{}, fmt.Errorf("secret name %q is used by both source %q and %q", source.Name, previous, sourceID)
 		}
-		for environment, fieldPath := range secret.Env {
-			if !environmentName.MatchString(environment) {
-				return Config{}, fmt.Errorf("secret %q: %q is not a valid environment variable name", name, environment)
+		seenNames[source.Name] = sourceID
+
+		// Auto-imported names are not available until Vault data is read. The
+		// controller repeats this ownership check for the complete desired map.
+		for environmentName := range source.Env {
+			if previous, duplicate := seenExplicitEnvironment[environmentName]; duplicate {
+				return Config{}, fmt.Errorf("environment variable %q is mapped by both source %q and %q", environmentName, previous, sourceID)
 			}
-			if fieldPath == "" {
-				return Config{}, fmt.Errorf("secret %q: Vault field path for %s cannot be empty", name, environment)
-			}
-			if previous, duplicate := seenEnvironment[environment]; duplicate {
-				return Config{}, fmt.Errorf("environment variable %s is mapped by both %q and %q", environment, previous, name)
-			}
-			seenEnvironment[environment] = name
+			seenExplicitEnvironment[environmentName] = sourceID
 		}
 	}
 
 	return result, nil
 }
 
-// DesiredEnvironmentNames returns a stable, sorted list. Stable ordering keeps
-// ServiceSpec updates deterministic and makes tests and docker service inspect
-// output easier to read.
-func (c Config) DesiredEnvironmentNames() []string {
-	var result []string
-	for _, secret := range c.Secrets {
-		for name := range secret.Env {
-			result = append(result, name)
-		}
+// ConfigHash detects changes to mount, path, source name or explicit mapping
+// even when the old and new Vault documents happen to have the same version.
+func ConfigHash(configuration Config) (string, error) {
+	encoded, err := json.Marshal(configuration.Secrets)
+	if err != nil {
+		return "", fmt.Errorf("marshal secret source configuration: %w", err)
 	}
-	sort.Strings(result)
-	return result
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func ParseAppliedVersions(serviceLabels map[string]string) (map[string]int, error) {
@@ -136,8 +176,8 @@ func ParseManagedEnvironment(serviceLabels map[string]string) ([]string, error) 
 		return nil, fmt.Errorf("parse controller label %s: %w", ManagedEnvLabel, err)
 	}
 	for _, name := range result {
-		if !environmentName.MatchString(name) {
-			return nil, fmt.Errorf("controller label %s contains invalid environment name %q", ManagedEnvLabel, name)
+		if name == "" || strings.Contains(name, "=") {
+			return nil, fmt.Errorf("controller label %s contains an environment name that cannot be represented in Docker Env: %q", ManagedEnvLabel, name)
 		}
 	}
 	sort.Strings(result)
@@ -165,5 +205,6 @@ func MarshalState(versions map[string]int, managedEnvironment []string) (string,
 func HasControllerState(serviceLabels map[string]string) bool {
 	return serviceLabels[AppliedVersionsLabel] != "" ||
 		serviceLabels[ManagedEnvLabel] != "" ||
-		serviceLabels[StateHashLabel] != ""
+		serviceLabels[StateHashLabel] != "" ||
+		serviceLabels[ConfigHashLabel] != ""
 }

@@ -4,7 +4,7 @@ This file is durable project context for humans and coding agents. Read it befor
 
 ## Project goal
 
-`docker-vault-injector` is a small reconciliation controller for Docker Swarm. It observes **service-level** `deploy.labels`, reads HashiCorp Vault KV v2 values, and writes selected values to `ServiceSpec.TaskTemplate.ContainerSpec.Env`. Docker Swarm performs task replacement and rollout.
+`docker-vault-injector` is a small reconciliation controller for Docker Swarm. It observes **service-level** `deploy.labels`, reads HashiCorp Vault KV v2 values, and writes them to `ServiceSpec.TaskTemplate.ContainerSpec.Env`. Flat documents are imported as-is by default; explicit field mappings are optional. Docker Swarm performs task replacement and rollout.
 
 The project intentionally does not support standalone Docker containers. A single host should run a single-node Swarm instead.
 
@@ -29,53 +29,53 @@ The project intentionally does not support standalone Docker containers. A singl
 8. A service update produced by this controller will produce another Docker event. Reconciliation must remain idempotent and terminate without another update.
 9. Service configuration belongs in `deploy.labels`, not task/container labels.
 10. Only one source may own a given environment variable.
+11. AppRole auth mount path is mandatory and must be a full `auth/<mount>` path without `/login`.
+12. Never log RoleID, SecretID, client token, or renewal response contents.
+13. AppRole credential files must be re-read on every login so operators can rotate credentials.
+14. Token lifecycle must retain proactive `lookup-self`, renewal before TTL, and re-login after revoke/expiry/renewal failure.
+15. Do not enforce shell-style environment naming conventions. Reject only names that Docker's `NAME=value` representation cannot encode unambiguously: empty names and names containing `=`.
+16. A collision between automatically imported and/or explicitly mapped environment names must abort reconciliation before `ServiceUpdate`.
 
 ## Public label contract
 
 User-controlled:
 
 - `io.github.docker-vault-injector.enabled`
-- `io.github.docker-vault-injector.secrets`
+- `io.github.docker-vault-injector.secrets.<source>.name`
+- `io.github.docker-vault-injector.secrets.<source>.kv`
+- `io.github.docker-vault-injector.secrets.<source>.vault-path`
+- `io.github.docker-vault-injector.secrets.<source>.env.<environment-name>` (optional)
 
 Controller-controlled:
 
 - `io.github.docker-vault-injector.applied-versions`
 - `io.github.docker-vault-injector.managed-env`
 - `io.github.docker-vault-injector.state-hash`
+- `io.github.docker-vault-injector.config-hash`
 
 All constants and parsing live in `internal/labels`. Do not duplicate literal label strings elsewhere.
 
-The `secrets` label is a JSON object keyed by an arbitrary source name:
+Labels are grouped by the arbitrary `<source>` segment. `name`, `kv`, and `vault-path` are required. `name` must be unique across sources; `kv` is the KV v2 mount; `vault-path` is its logical path.
 
-```json
-{
-  "database": {
-    "mount": "kv",
-    "path": "apps/api/database",
-    "env": {
-      "DB_USER": "username",
-      "DB_PASSWORD": "credentials.password"
-    }
-  }
-}
-```
+With no `.env.*` labels for a source, import every top-level scalar Vault field using the field name unchanged. If one or more `.env.*` labels exist, import only those mappings; the suffix is the target environment name and the label value is a dotted Vault field path. Objects, arrays, and null are never encoded into environment values.
 
-Changing this schema is a public API change. Maintain backwards compatibility or document a migration.
+The old multiline `io.github.docker-vault-injector.secrets` JSON label is not supported. This is currently a pre-release project, so the flat schema intentionally replaced it instead of adding a compatibility parser. Any future schema change is a public API change and needs an explicit migration story.
 
 ## Reconciliation algorithm
 
 For an enabled service:
 
 1. Parse and validate labels.
-2. Parse controller-owned applied versions, managed names, and state hash.
+2. Parse controller-owned applied versions, managed names, state hash, and config hash.
 3. Read `current_version` metadata for every configured source.
-4. Compare versions, desired managed names, and the hash of current managed environment values.
+4. Compare versions, configuration hash, and the hash of current previously-managed environment values.
 5. If all match, return without reading Vault data or updating Docker.
 6. Otherwise read the exact current version of every source.
-7. Resolve dotted field paths and reject null/object/array values.
-8. Remove previously managed keys, preserve unrelated environment entries, append desired keys in sorted order.
-9. Update controller state labels.
-10. Call one `ServiceUpdate` with the version from the inspected service.
+7. Auto-import all top-level scalar fields for sources without mappings; otherwise resolve the explicit dotted field paths.
+8. Reject null/object/array values and reject duplicate environment ownership across every source.
+9. Remove previously managed keys, preserve unrelated environment entries, append desired keys in sorted order.
+10. Update controller state labels.
+11. Call one `ServiceUpdate` with the version from the inspected service.
 
 For a disabled service with controller state, remove previously managed environment keys and controller state labels. Keep the user's `enabled=false` label.
 
@@ -119,7 +119,7 @@ The module path `github.com/vyktory/docker-vault-injector` is provisional becaus
 
 ## Known limitations and likely next steps
 
-- Vault token is read once at startup; no AppRole login or token renewal yet.
+- AppRole uses reusable RoleID/SecretID credentials; response-wrapped SecretID delivery is not implemented yet.
 - One controller replica is expected. Multiple replicas are mostly protected by Docker optimistic locking but can cause noisy conflicts; implement leader election before recommending HA replicas.
 - Reapplying a stack file can cause one rollout from `docker stack deploy` and a second rollout from reinjection.
 - There is no Prometheus metrics or HTTP health endpoint.
@@ -127,4 +127,3 @@ The module path `github.com/vyktory/docker-vault-injector` is provisional becaus
 - Full end-to-end tests against a real single-node Swarm and Vault dev server are not present.
 
 When implementing these, preserve the small explicit architecture and update both README.md and this file.
-
