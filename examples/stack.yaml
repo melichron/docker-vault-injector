@@ -1,0 +1,53 @@
+version: "3.8"
+
+services:
+  injector:
+    image: docker-vault-injector:dev
+    environment:
+      VAULT_ADDR: "https://vault.example.com:8200"
+      VAULT_TOKEN_FILE: "/run/secrets/vault_injector_token"
+      INJECTOR_POLL_INTERVAL: "30s"
+      INJECTOR_LOG_LEVEL: "info"
+    secrets:
+      - vault_injector_token
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role==manager
+      restart_policy:
+        condition: any
+        delay: 5s
+
+  example:
+    image: alpine:3.22
+    command: ["sh", "-c", "while true; do sleep 3600; done"]
+    environment:
+      LOG_LEVEL: "info"
+    deploy:
+      replicas: 1
+      labels:
+        io.github.docker-vault-injector.enabled: "true"
+        io.github.docker-vault-injector.secrets: |
+          {
+            "database": {
+              "mount": "kv",
+              "path": "apps/example/database",
+              "env": {
+                "DB_USER": "username",
+                "DB_PASSWORD": "password",
+                "DB_HOST": "connection.host",
+                "DB_PORT": "connection.port"
+              }
+            }
+          }
+      update_config:
+        order: start-first
+        parallelism: 1
+        failure_action: rollback
+
+secrets:
+  vault_injector_token:
+    external: true
