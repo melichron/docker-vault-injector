@@ -10,6 +10,9 @@ services:
       VAULT_APPROLE_AUTH_PATH: "auth/docker-swarm"
       VAULT_APPROLE_ROLE_ID_FILE: "/run/secrets/vault_approle_role_id"
       VAULT_APPROLE_SECRET_ID_FILE: "/run/secrets/vault_approle_secret_id"
+      # Or directly by variables
+      # VAULT_APPROLE_ROLE_ID: "yyyyyyyy-gggg-1111-tttt-123456789abc"
+      # VAULT_APPROLE_SECRET_ID: "xxxxxxxx-gggg-1111-tttt-123456789abc"
       VAULT_TOKEN_CHECK_INTERVAL: "30s"
       INJECTOR_POLL_INTERVAL: "30s"
       INJECTOR_LOG_LEVEL: "info"
