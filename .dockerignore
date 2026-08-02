@@ -6,6 +6,7 @@ Dockerfile*
 README.md
 AGENTS.md
 tmp/*
+examples/*
 gen-repo-snapshot.sh
 REPO_SNAPSHOT.md
 Makefile
