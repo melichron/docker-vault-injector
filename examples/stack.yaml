@@ -1,5 +1,13 @@
 version: "3.8"
 
+# This stack contains the injector and five independent injection examples.
+# Every `kv` label names a deliberately explicit KV v2 mount that an operator
+# would create in Vault. Grant the injector policy read access to both the
+# `metadata/` and `data/` paths of every mount used below.
+#
+# The example secret values shown in comments are illustrative. Do not store
+# real credentials in this file.
+
 services:
   injector:
     image: ghcr.io/melichron/docker-vault-injector:latest
@@ -10,7 +18,8 @@ services:
       VAULT_APPROLE_AUTH_PATH: "auth/docker-swarm"
       VAULT_APPROLE_ROLE_ID_FILE: "/run/secrets/vault_approle_role_id"
       VAULT_APPROLE_SECRET_ID_FILE: "/run/secrets/vault_approle_secret_id"
-      # Or directly by variables
+      # AppRole credentials may alternatively be passed directly. Files are
+      # preferred because the injector re-reads them before every login.
       # VAULT_APPROLE_ROLE_ID: "yyyyyyyy-gggg-1111-tttt-123456789abc"
       # VAULT_APPROLE_SECRET_ID: "xxxxxxxx-gggg-1111-tttt-123456789abc"
       VAULT_TOKEN_CHECK_INTERVAL: "30s"
@@ -36,24 +45,184 @@ services:
         condition: any
         delay: 5s
 
-  example:
+  # Example 1: import one flat Vault document as-is.
+  #
+  # Mount: example-backend-kv
+  # Path:  applications/backend/runtime
+  # Data:
+  #   {
+  #     "BACKEND_LOG_LEVEL": "info",
+  #     "BACKEND_PUBLIC_URL": "https://backend.example.com",
+  #     "BACKEND_WORKERS": 4
+  #   }
+  #
+  # No `.env.*` labels are present, so all three top-level scalar fields become
+  # environment variables with exactly the same names.
+  flat-secret-as-is:
     image: alpine:3.22
     command: ["sh", "-c", "while true; do sleep 3600; done"]
-    environment:
-      LOG_LEVEL: "info"
     deploy:
       replicas: 1
       labels:
         io.github.docker-vault-injector.enabled: "true"
-        # With no .env.* labels, all top-level scalar fields are imported
-        # using their Vault keys as environment variable names.
-        io.github.docker-vault-injector.secrets.database.name: "db-vars"
-        io.github.docker-vault-injector.secrets.database.kv: "approle-accessed-kv"
-        io.github.docker-vault-injector.secrets.database.vault-path: "apps/example/database"
+        io.github.docker-vault-injector.secrets.backend-runtime.name: "backend-runtime-settings"
+        io.github.docker-vault-injector.secrets.backend-runtime.kv: "example-backend-kv"
+        io.github.docker-vault-injector.secrets.backend-runtime.vault-path: "applications/backend/runtime"
       update_config:
         order: start-first
         parallelism: 1
         failure_action: rollback
+
+  # Example 2: combine two independent flat Vault documents in one service.
+  #
+  # Mount: example-shared-services-kv
+  # Path:  environments/demo/common
+  # Data:  {"TZ":"Europe/Kyiv","OTEL_SERVICE_NAME":"orders-api"}
+  #
+  # Mount: example-orders-database-kv
+  # Path:  applications/orders/database
+  # Data:  {"DB_HOST":"orders-db","DB_PORT":5432,"DB_USER":"orders"}
+  #
+  # Both documents are imported as-is. Their top-level keys must not overlap:
+  # one environment variable may be owned by only one Vault source.
+  two-flat-secrets:
+    image: alpine:3.22
+    command: ["sh", "-c", "while true; do sleep 3600; done"]
+    deploy:
+      replicas: 1
+      labels:
+        io.github.docker-vault-injector.enabled: "true"
+
+        io.github.docker-vault-injector.secrets.shared-runtime.name: "shared-runtime-settings"
+        io.github.docker-vault-injector.secrets.shared-runtime.kv: "example-shared-services-kv"
+        io.github.docker-vault-injector.secrets.shared-runtime.vault-path: "environments/demo/common"
+
+        io.github.docker-vault-injector.secrets.orders-database.name: "orders-database-connection"
+        io.github.docker-vault-injector.secrets.orders-database.kv: "example-orders-database-kv"
+        io.github.docker-vault-injector.secrets.orders-database.vault-path: "applications/orders/database"
+      update_config:
+        order: start-first
+        parallelism: 1
+        failure_action: rollback
+
+  # Example 3: keep an initialization-sensitive service unscheduled until its
+  # first successful injection.
+  #
+  # Mount: example-postgres-bootstrap-kv
+  # Path:  databases/reporting/bootstrap
+  # Data:
+  #   {
+  #     "POSTGRES_DB": "reporting",
+  #     "POSTGRES_USER": "reporting_app",
+  #     "POSTGRES_PASSWORD": "replace-with-a-real-secret"
+  #   }
+  #
+  # Never add `io.github.docker-vault-injector.gate=open` to a Swarm node. The
+  # impossible constraint leaves the task Pending. After resolving Vault data,
+  # the injector installs POSTGRES_* and removes only that reserved constraint
+  # in the same ServiceUpdate. Keep the gate label and constraint in this file
+  # so later `docker stack deploy` operations are gated again.
+  gated-postgres:
+    image: postgres:17-alpine
+    volumes:
+      - postgres_example_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    stop_grace_period: 60s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          # A real application constraint is preserved after injection.
+          - node.role==manager
+          # This exact reserved constraint is removed after injection.
+          - node.labels.io.github.docker-vault-injector.gate==open
+      labels:
+        io.github.docker-vault-injector.enabled: "true"
+        io.github.docker-vault-injector.bootstrap-gate: "true"
+        io.github.docker-vault-injector.secrets.postgres-bootstrap.name: "reporting-postgres-bootstrap"
+        io.github.docker-vault-injector.secrets.postgres-bootstrap.kv: "example-postgres-bootstrap-kv"
+        io.github.docker-vault-injector.secrets.postgres-bootstrap.vault-path: "databases/reporting/bootstrap"
+      update_config:
+        order: stop-first
+        parallelism: 1
+        failure_action: rollback
+      restart_policy:
+        condition: any
+        delay: 5s
+
+  # Example 4: import only selected top-level fields and rename them.
+  #
+  # Mount: example-payment-provider-kv
+  # Path:  integrations/payment-provider/credentials
+  # Data:
+  #   {
+  #     "client_id": "demo-client",
+  #     "client_secret": "replace-with-a-real-secret",
+  #     "operator_note": "this field must not enter the container"
+  #   }
+  #
+  # Because `.env.*` labels are present, automatic import is disabled for this
+  # source. Only client_id and client_secret are injected, under the explicit
+  # PAYMENT_CLIENT_ID and PAYMENT_CLIENT_SECRET environment names.
+  selected-top-level-fields:
+    image: alpine:3.22
+    command: ["sh", "-c", "while true; do sleep 3600; done"]
+    deploy:
+      replicas: 1
+      labels:
+        io.github.docker-vault-injector.enabled: "true"
+        io.github.docker-vault-injector.secrets.payment-provider.name: "payment-provider-credentials"
+        io.github.docker-vault-injector.secrets.payment-provider.kv: "example-payment-provider-kv"
+        io.github.docker-vault-injector.secrets.payment-provider.vault-path: "integrations/payment-provider/credentials"
+        io.github.docker-vault-injector.secrets.payment-provider.env.PAYMENT_CLIENT_ID: "client_id"
+        io.github.docker-vault-injector.secrets.payment-provider.env.PAYMENT_CLIENT_SECRET: "client_secret"
+      update_config:
+        order: start-first
+        parallelism: 1
+        failure_action: rollback
+
+  # Example 5: resolve selected scalar values from a nested JSON document.
+  #
+  # Mount: example-structured-application-kv
+  # Path:  applications/notifications/structured-config
+  # Data:
+  #   {
+  #     "smtp": {
+  #       "endpoint": {"host":"smtp.example.com","port":587},
+  #       "credentials": {"username":"mailer","password":"secret"}
+  #     },
+  #     "features": {"delivery_reports":true}
+  #   }
+  #
+  # Label values are dotted paths inside the Vault JSON document. Only scalar
+  # leaves can be injected; an object, array, or null value is rejected.
+  selected-nested-json-fields:
+    image: alpine:3.22
+    command: ["sh", "-c", "while true; do sleep 3600; done"]
+    deploy:
+      replicas: 1
+      labels:
+        io.github.docker-vault-injector.enabled: "true"
+        io.github.docker-vault-injector.secrets.notification-config.name: "notification-structured-config"
+        io.github.docker-vault-injector.secrets.notification-config.kv: "example-structured-application-kv"
+        io.github.docker-vault-injector.secrets.notification-config.vault-path: "applications/notifications/structured-config"
+        io.github.docker-vault-injector.secrets.notification-config.env.SMTP_HOST: "smtp.endpoint.host"
+        io.github.docker-vault-injector.secrets.notification-config.env.SMTP_PORT: "smtp.endpoint.port"
+        io.github.docker-vault-injector.secrets.notification-config.env.SMTP_USERNAME: "smtp.credentials.username"
+        io.github.docker-vault-injector.secrets.notification-config.env.SMTP_PASSWORD: "smtp.credentials.password"
+        io.github.docker-vault-injector.secrets.notification-config.env.DELIVERY_REPORTS_ENABLED: "features.delivery_reports"
+      update_config:
+        order: start-first
+        parallelism: 1
+        failure_action: rollback
+
+volumes:
+  postgres_example_data:
 
 secrets:
   vault_approle_role_id:
