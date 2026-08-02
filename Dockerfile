@@ -14,7 +14,8 @@ COPY . .
 
 ARG TARGETOS=linux
 ARG TARGETARCH
-RUN --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
+    --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" \
     -o /out/docker-vault-injector ./cmd/docker-vault-injector
