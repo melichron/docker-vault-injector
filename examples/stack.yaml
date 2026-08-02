@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   injector:
-    image: docker-vault-injector:dev
+    image: ghcr.io/melichron/docker-vault-injector:latest
     environment:
       VAULT_ADDR: "https://vault.example.com:8200"
       VAULT_AUTH_METHOD: "approle"
