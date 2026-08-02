@@ -202,6 +202,19 @@ func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service
 	if err != nil {
 		return err
 	}
+	bootstrapGatePresent := hasBootstrapGate(service)
+	if bootstrapGatePresent && !configuration.BootstrapGate {
+		return fmt.Errorf("service contains reserved placement constraint %q but %s is not true", labels.BootstrapGateConstraint, labels.BootstrapGateLabel)
+	}
+	hasSuccessfulInjectionState := service.Spec.Labels[labels.ConfigHashLabel] == configurationHash &&
+		service.Spec.Labels[labels.AppliedVersionsLabel] != "" &&
+		service.Spec.Labels[labels.ManagedEnvLabel] != "" &&
+		service.Spec.Labels[labels.StateHashLabel] != ""
+	if configuration.BootstrapGate &&
+		!bootstrapGatePresent &&
+		!hasSuccessfulInjectionState {
+		return fmt.Errorf("%s is true but placement constraint %q is missing; refusing an ungated initial or configuration-changing injection", labels.BootstrapGateLabel, labels.BootstrapGateConstraint)
+	}
 
 	currentVersions := make(map[string]int, len(configuration.Secrets))
 	sourceNames := sortedSourceNames(configuration.Secrets)
@@ -221,7 +234,8 @@ func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service
 	currentManagedValues := environment.Select(service.Spec.TaskTemplate.ContainerSpec.Env, previouslyManaged)
 	stateIsCurrent := maps.Equal(currentVersions, appliedVersions) &&
 		service.Spec.Labels[labels.ConfigHashLabel] == configurationHash &&
-		environment.Hash(currentManagedValues) == service.Spec.Labels[labels.StateHashLabel]
+		environment.Hash(currentManagedValues) == service.Spec.Labels[labels.StateHashLabel] &&
+		!bootstrapGatePresent
 	if stateIsCurrent {
 		return nil
 	}
@@ -288,6 +302,10 @@ func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service
 	updated.Spec.Labels[labels.ManagedEnvLabel] = managedJSON
 	updated.Spec.Labels[labels.StateHashLabel] = environment.Hash(desiredValues)
 	updated.Spec.Labels[labels.ConfigHashLabel] = configurationHash
+	bootstrapGateRemoved := false
+	if configuration.BootstrapGate {
+		bootstrapGateRemoved = removeBootstrapGate(&updated)
+	}
 
 	if slices.Equal(service.Spec.TaskTemplate.ContainerSpec.Env, updated.Spec.TaskTemplate.ContainerSpec.Env) &&
 		maps.Equal(service.Spec.Labels, updated.Spec.Labels) {
@@ -302,6 +320,7 @@ func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service
 		"service_id", service.ID,
 		"versions", versionsJSON,
 		"environment_names", desiredNames,
+		"bootstrap_gate_removed", bootstrapGateRemoved,
 	)
 	return nil
 }
@@ -352,7 +371,53 @@ func cloneServiceForUpdate(service swarm.Service) swarm.Service {
 		containerSpec.Env = slices.Clone(original.Env)
 		updated.Spec.TaskTemplate.ContainerSpec = &containerSpec
 	}
+	if original := service.Spec.TaskTemplate.Placement; original != nil {
+		placement := *original
+		placement.Constraints = slices.Clone(original.Constraints)
+		updated.Spec.TaskTemplate.Placement = &placement
+	}
 	return updated
+}
+
+func hasBootstrapGate(service swarm.Service) bool {
+	placement := service.Spec.TaskTemplate.Placement
+	if placement == nil {
+		return false
+	}
+	for _, constraint := range placement.Constraints {
+		if isBootstrapGateConstraint(constraint) {
+			return true
+		}
+	}
+	return false
+}
+
+// removeBootstrapGate removes every copy of the reserved constraint while
+// preserving the order and exact spelling of every operator-owned constraint.
+// The service must already have been cloned with cloneServiceForUpdate.
+func removeBootstrapGate(service *swarm.Service) bool {
+	placement := service.Spec.TaskTemplate.Placement
+	if placement == nil {
+		return false
+	}
+
+	constraints := placement.Constraints[:0]
+	removed := false
+	for _, constraint := range placement.Constraints {
+		if isBootstrapGateConstraint(constraint) {
+			removed = true
+			continue
+		}
+		constraints = append(constraints, constraint)
+	}
+	placement.Constraints = constraints
+	return removed
+}
+
+func isBootstrapGateConstraint(constraint string) bool {
+	// Compose accepts whitespace around the equality operator. Compare a
+	// whitespace-free representation so the documented forms behave equally.
+	return strings.Join(strings.Fields(constraint), "") == labels.BootstrapGateConstraint
 }
 
 func resolveField(data map[string]any, fieldPath string) (string, error) {

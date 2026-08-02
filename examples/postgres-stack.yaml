@@ -1,0 +1,83 @@
+version: "3.8"
+
+# This stack demonstrates the bootstrap gate with an initialization-sensitive
+# image. The Postgres task cannot be scheduled until the injector has read
+# Vault, written POSTGRES_* to ContainerSpec.Env, and removed only its reserved
+# placement constraint in the same ServiceUpdate.
+
+services:
+  injector:
+    image: docker-vault-injector:dev
+    environment:
+      VAULT_ADDR: "https://vault.example.com:8200"
+      VAULT_AUTH_METHOD: "approle"
+      VAULT_APPROLE_AUTH_PATH: "auth/docker-swarm"
+      VAULT_APPROLE_ROLE_ID_FILE: "/run/secrets/vault_approle_role_id"
+      VAULT_APPROLE_SECRET_ID_FILE: "/run/secrets/vault_approle_secret_id"
+      VAULT_TOKEN_CHECK_INTERVAL: "30s"
+      INJECTOR_POLL_INTERVAL: "30s"
+      INJECTOR_LOG_LEVEL: "info"
+    secrets:
+      - vault_approle_role_id
+      - vault_approle_secret_id
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role==manager
+      restart_policy:
+        condition: any
+        delay: 5s
+
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    stop_grace_period: 60s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          # This is a real placement constraint and remains after injection.
+          # The example targets a single-node Swarm. Pin stateful workloads to
+          # durable storage explicitly in a multi-node cluster.
+          - node.role==manager
+
+          # Never add this label to a node. The injector removes this exact
+          # constraint only after every Vault value has been resolved.
+          - node.labels.io.github.docker-vault-injector.gate==open
+      labels:
+        io.github.docker-vault-injector.enabled: "true"
+        io.github.docker-vault-injector.bootstrap-gate: "true"
+
+        # Store POSTGRES_USER, POSTGRES_PASSWORD, and POSTGRES_DB as top-level
+        # scalar keys in this Vault KV v2 document. They are imported as-is.
+        io.github.docker-vault-injector.secrets.postgres.name: "postgres-init"
+        io.github.docker-vault-injector.secrets.postgres.kv: "kv"
+        io.github.docker-vault-injector.secrets.postgres.vault-path: "apps/example/postgres"
+      update_config:
+        order: stop-first
+        parallelism: 1
+        failure_action: rollback
+      restart_policy:
+        condition: any
+        delay: 5s
+
+volumes:
+  postgres_data:
+
+secrets:
+  vault_approle_role_id:
+    external: true
+  vault_approle_secret_id:
+    external: true

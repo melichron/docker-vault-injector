@@ -38,6 +38,35 @@ func TestSourceWithoutEnvUsesAutomaticImport(t *testing.T) {
 	}
 }
 
+func TestParseBootstrapGate(t *testing.T) {
+	configuration, err := ParseConfig(map[string]string{
+		EnabledLabel:                        "true",
+		BootstrapGateLabel:                  "true",
+		SecretsPrefix + "common.name":       "common-vars",
+		SecretsPrefix + "common.kv":         "kv",
+		SecretsPrefix + "common.vault-path": "apps/common",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !configuration.BootstrapGate {
+		t.Fatal("bootstrap gate was not enabled")
+	}
+}
+
+func TestParseBootstrapGateRejectsInvalidBoolean(t *testing.T) {
+	_, err := ParseConfig(map[string]string{
+		EnabledLabel:                        "true",
+		BootstrapGateLabel:                  "sometimes",
+		SecretsPrefix + "common.name":       "common-vars",
+		SecretsPrefix + "common.kv":         "kv",
+		SecretsPrefix + "common.vault-path": "apps/common",
+	})
+	if err == nil {
+		t.Fatal("invalid bootstrap-gate boolean should fail")
+	}
+}
+
 func TestParseConfigRejectsDuplicateExplicitEnvironmentOwnership(t *testing.T) {
 	_, err := ParseConfig(map[string]string{
 		EnabledLabel:                     "true",
@@ -98,6 +127,27 @@ func TestConfigHashChangesWithSourceConfiguration(t *testing.T) {
 	}
 	if firstHash == secondHash {
 		t.Fatal("different source configurations must not have the same state hash")
+	}
+}
+
+func TestConfigHashIncludesBootstrapGate(t *testing.T) {
+	configuration := Config{
+		Enabled: true,
+		Secrets: map[string]SecretSource{
+			"source": {Name: "source", Mount: "kv", Path: "apps/source"},
+		},
+	}
+	withoutGate, err := ConfigHash(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration.BootstrapGate = true
+	withGate, err := ConfigHash(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withoutGate == withGate {
+		t.Fatal("bootstrap gate must be part of the configuration hash")
 	}
 }
 
