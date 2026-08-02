@@ -10,10 +10,13 @@ import (
 	"time"
 )
 
+const DefaultStatusFile = "/tmp/docker-vault-injector-status.json"
+
 type Config struct {
 	PollInterval       time.Duration
 	ReconcileTimeout   time.Duration
 	EventRetryInterval time.Duration
+	StatusFile         string
 	VaultAuth          VaultAuthConfig
 	LogLevel           slog.Level
 }
@@ -89,6 +92,7 @@ func Load() (Config, error) {
 		PollInterval:       pollInterval,
 		ReconcileTimeout:   reconcileTimeout,
 		EventRetryInterval: eventRetryInterval,
+		StatusFile:         StatusFileFromEnvironment(),
 		VaultAuth: VaultAuthConfig{
 			Method:              authMethod,
 			AppRoleAuthPath:     os.Getenv("VAULT_APPROLE_AUTH_PATH"),
@@ -103,6 +107,16 @@ func Load() (Config, error) {
 		},
 		LogLevel: level,
 	}, nil
+}
+
+// StatusFileFromEnvironment is intentionally independent from Load so the
+// status subcommands can read the running controller's snapshot without
+// requiring Docker or Vault authentication settings.
+func StatusFileFromEnvironment() string {
+	if value := strings.TrimSpace(os.Getenv("INJECTOR_STATUS_FILE")); value != "" {
+		return value
+	}
+	return DefaultStatusFile
 }
 
 func durationFromEnvironment(name string, fallback time.Duration) (time.Duration, error) {

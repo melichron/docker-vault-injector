@@ -5,15 +5,19 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/api/types/swarm"
 
-	"github.com/vyktory/docker-vault-injector/internal/labels"
-	"github.com/vyktory/docker-vault-injector/internal/vaultclient"
+	"github.com/melichron/docker-vault-injector/internal/labels"
+	statusview "github.com/melichron/docker-vault-injector/internal/status"
+	"github.com/melichron/docker-vault-injector/internal/vaultclient"
 )
 
 type fakeDocker struct {
@@ -135,6 +139,71 @@ func TestReconcileRepairsEnvironmentDriftWithoutVersionChange(t *testing.T) {
 	}
 }
 
+func TestStatusSnapshotRecordsResultsWithoutSecretValues(t *testing.T) {
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	statusStore, err := statusview.NewStore(statusPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	docker := &fakeDocker{}
+	vault := &fakeVault{
+		versions: map[string]int{"kv/apps/api": 7},
+		secrets: map[string]vaultclient.Secret{
+			"kv/apps/api": {Version: 7, Data: map[string]any{
+				"username": "api-user",
+				"database": map[string]any{"password": "correct horse"},
+			}},
+		},
+	}
+	controller := testControllerWithStatus(docker, vault, statusStore)
+
+	if err := controller.ReconcileService(context.Background(), managedService()); err != nil {
+		t.Fatal(err)
+	}
+	rawSnapshot, err := os.ReadFile(statusPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"api-user", "correct horse"} {
+		if strings.Contains(string(rawSnapshot), forbidden) {
+			t.Fatalf("status snapshot contains secret value %q", forbidden)
+		}
+	}
+	snapshot, err := statusview.Read(statusPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Services) != 1 {
+		t.Fatalf("status services = %d, want 1", len(snapshot.Services))
+	}
+	serviceStatus := snapshot.Services[0]
+	if serviceStatus.State != statusview.StateReady {
+		t.Fatalf("state = %q, want ready", serviceStatus.State)
+	}
+	if !slices.Equal(serviceStatus.EnvironmentNames, []string{"DB_PASSWORD", "DB_USER"}) {
+		t.Fatalf("environment names = %v", serviceStatus.EnvironmentNames)
+	}
+	if serviceStatus.Versions["database"] != 7 || serviceStatus.LastSuccess == nil {
+		t.Fatalf("unexpected successful status: %#v", serviceStatus)
+	}
+
+	vault.currentVersionError = errors.New("Vault unavailable")
+	if err := controller.ReconcileService(context.Background(), docker.updates[0]); err == nil {
+		t.Fatal("expected Vault error")
+	}
+	snapshot, err = statusview.Read(statusPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceStatus = snapshot.Services[0]
+	if serviceStatus.State != statusview.StateError || !strings.Contains(serviceStatus.Error, "Vault unavailable") {
+		t.Fatalf("unexpected error status: %#v", serviceStatus)
+	}
+	if serviceStatus.LastSuccess == nil {
+		t.Fatal("failed reconciliation erased the last successful timestamp")
+	}
+}
+
 func TestBootstrapGateIsRemovedAtomicallyWithEnvironmentInjection(t *testing.T) {
 	docker := &fakeDocker{}
 	vault := &fakeVault{
@@ -180,6 +249,18 @@ func TestBootstrapGateIsRemovedAtomicallyWithEnvironmentInjection(t *testing.T) 
 	if len(docker.updates) != 1 {
 		t.Fatal("the opened, current service caused an unnecessary update")
 	}
+	regated := cloneServiceForUpdate(updated)
+	regated.Spec.TaskTemplate.Placement.Constraints = append(
+		regated.Spec.TaskTemplate.Placement.Constraints,
+		labels.BootstrapGateConstraint,
+	)
+	if err := testController(docker, vault).ReconcileService(context.Background(), regated); err != nil {
+		t.Fatalf("reconcile after stack reapplied only the gate failed: %v", err)
+	}
+	if len(docker.updates) != 2 || hasBootstrapGate(docker.updates[1]) {
+		t.Fatal("a reapplied gate must be removed even when environment and state are current")
+	}
+	updated = docker.updates[1]
 
 	vault.versions["kv/apps/api"] = 8
 	vault.secrets["kv/apps/api"] = vaultclient.Secret{Version: 8, Data: map[string]any{
@@ -189,10 +270,10 @@ func TestBootstrapGateIsRemovedAtomicallyWithEnvironmentInjection(t *testing.T) 
 	if err := testController(docker, vault).ReconcileService(context.Background(), updated); err != nil {
 		t.Fatalf("ordinary Vault rotation after opening the gate failed: %v", err)
 	}
-	if len(docker.updates) != 2 {
-		t.Fatalf("Vault rotation updates = %d, want 2 total", len(docker.updates))
+	if len(docker.updates) != 3 {
+		t.Fatalf("Vault rotation updates = %d, want 3 total", len(docker.updates))
 	}
-	if hasBootstrapGate(docker.updates[1]) {
+	if hasBootstrapGate(docker.updates[2]) {
 		t.Fatal("ordinary Vault rotation must not restore the bootstrap gate")
 	}
 }
@@ -451,6 +532,10 @@ func managedService() swarm.Service {
 }
 
 func testController(docker Docker, vault Vault) *Controller {
+	return testControllerWithStatus(docker, vault, nil)
+}
+
+func testControllerWithStatus(docker Docker, vault Vault, statusStore *statusview.Store) *Controller {
 	return New(
 		docker,
 		vault,
@@ -458,5 +543,6 @@ func testController(docker Docker, vault Vault) *Controller {
 		time.Minute,
 		time.Minute,
 		time.Second,
+		statusStore,
 	)
 }

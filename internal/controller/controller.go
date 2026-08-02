@@ -20,9 +20,10 @@ import (
 	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/api/types/swarm"
 
-	"github.com/vyktory/docker-vault-injector/internal/environment"
-	"github.com/vyktory/docker-vault-injector/internal/labels"
-	"github.com/vyktory/docker-vault-injector/internal/vaultclient"
+	"github.com/melichron/docker-vault-injector/internal/environment"
+	"github.com/melichron/docker-vault-injector/internal/labels"
+	statusview "github.com/melichron/docker-vault-injector/internal/status"
+	"github.com/melichron/docker-vault-injector/internal/vaultclient"
 )
 
 type Docker interface {
@@ -44,6 +45,7 @@ type Controller struct {
 	pollInterval       time.Duration
 	reconcileTimeout   time.Duration
 	eventRetryInterval time.Duration
+	status             *statusview.Store
 }
 
 func New(
@@ -53,6 +55,7 @@ func New(
 	pollInterval time.Duration,
 	reconcileTimeout time.Duration,
 	eventRetryInterval time.Duration,
+	statusStore *statusview.Store,
 ) *Controller {
 	return &Controller{
 		docker:             docker,
@@ -61,6 +64,7 @@ func New(
 		pollInterval:       pollInterval,
 		reconcileTimeout:   reconcileTimeout,
 		eventRetryInterval: eventRetryInterval,
+		status:             statusStore,
 	}
 }
 
@@ -137,7 +141,9 @@ func (c *Controller) reconcileAllWithLogging(parent context.Context, reason stri
 	}
 
 	c.logger.Debug("starting full reconciliation", "reason", reason, "services", len(services))
+	activeServiceIDs := make([]string, 0, len(services))
 	for _, service := range services {
+		activeServiceIDs = append(activeServiceIDs, service.ID)
 		// One slow or unavailable Vault path must not consume the timeout budget
 		// of every service that follows it.
 		reconcileContext, cancelReconcile := context.WithTimeout(parent, c.reconcileTimeout)
@@ -150,6 +156,11 @@ func (c *Controller) reconcileAllWithLogging(parent context.Context, reason stri
 				"reason", reason,
 				"error", err,
 			)
+		}
+	}
+	if c.status != nil {
+		if err := c.status.Prune(activeServiceIDs); err != nil {
+			c.logger.Warn("cannot prune status snapshot", "error", err)
 		}
 	}
 }
@@ -178,13 +189,43 @@ func (c *Controller) reconcileIDWithLogging(parent context.Context, serviceID, r
 
 // ReconcileService is public within the package API primarily to make the core
 // behavior easy to test. It performs at most one Docker ServiceUpdate.
-func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service) error {
+func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service) (reconcileErr error) {
+	tracked := service.Spec.Labels[labels.EnabledLabel] != "" ||
+		labels.HasControllerState(service.Spec.Labels) ||
+		hasBootstrapGate(service)
+	if !tracked {
+		c.removeStatus(service.ID)
+		return nil
+	}
+
+	report := statusview.Service{
+		ID:    service.ID,
+		Name:  service.Spec.Name,
+		State: statusview.StateReady,
+		Gate:  statusview.GateNotUsed,
+	}
+	if hasBootstrapGate(service) {
+		report.Gate = statusview.GateClosed
+	}
+	defer func() {
+		if reconcileErr != nil {
+			report.State = statusview.StateError
+			report.Error = reconcileErr.Error()
+		}
+		c.recordStatus(report, reconcileErr == nil)
+	}()
+
 	configuration, err := labels.ParseConfig(service.Spec.Labels)
 	if err != nil {
 		return err
 	}
 	if !configuration.Enabled {
+		report.State = statusview.StateDisabled
 		return c.removeManagedEnvironment(ctx, service)
+	}
+	report.Sources = sortedSourceNames(configuration.Secrets)
+	if configuration.BootstrapGate && report.Gate != statusview.GateClosed {
+		report.Gate = statusview.GateOpen
 	}
 	if service.Spec.TaskTemplate.ContainerSpec == nil {
 		return fmt.Errorf("service does not use a container task specification")
@@ -194,10 +235,12 @@ func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service
 	if err != nil {
 		return err
 	}
+	report.Versions = appliedVersions
 	previouslyManaged, err := labels.ParseManagedEnvironment(service.Spec.Labels)
 	if err != nil {
 		return err
 	}
+	report.EnvironmentNames = previouslyManaged
 	configurationHash, err := labels.ConfigHash(configuration)
 	if err != nil {
 		return err
@@ -213,6 +256,7 @@ func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service
 	if configuration.BootstrapGate &&
 		!bootstrapGatePresent &&
 		!hasSuccessfulInjectionState {
+		report.Gate = statusview.GateMissing
 		return fmt.Errorf("%s is true but placement constraint %q is missing; refusing an ungated initial or configuration-changing injection", labels.BootstrapGateLabel, labels.BootstrapGateConstraint)
 	}
 
@@ -226,6 +270,7 @@ func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service
 		}
 		currentVersions[sourceName] = version
 	}
+	report.Versions = currentVersions
 
 	// In automatic-import mode the desired environment names live in Vault,
 	// not in service labels. The names recorded by the previous successful
@@ -286,6 +331,7 @@ func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service
 		}
 	}
 	desiredNames := sortedMappingNames(desiredValues)
+	report.EnvironmentNames = desiredNames
 
 	updated := cloneServiceForUpdate(service)
 	updated.Spec.TaskTemplate.ContainerSpec.Env = environment.Merge(
@@ -308,12 +354,16 @@ func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service
 	}
 
 	if slices.Equal(service.Spec.TaskTemplate.ContainerSpec.Env, updated.Spec.TaskTemplate.ContainerSpec.Env) &&
-		maps.Equal(service.Spec.Labels, updated.Spec.Labels) {
+		maps.Equal(service.Spec.Labels, updated.Spec.Labels) &&
+		slices.Equal(placementConstraints(service), placementConstraints(updated)) {
 		return nil
 	}
 
 	if err := c.docker.UpdateService(ctx, updated); err != nil {
 		return err
+	}
+	if bootstrapGateRemoved {
+		report.Gate = statusview.GateOpen
 	}
 	c.logger.Info("applied Vault environment",
 		"service", service.Spec.Name,
@@ -323,6 +373,31 @@ func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service
 		"bootstrap_gate_removed", bootstrapGateRemoved,
 	)
 	return nil
+}
+
+func placementConstraints(service swarm.Service) []string {
+	if service.Spec.TaskTemplate.Placement == nil {
+		return nil
+	}
+	return service.Spec.TaskTemplate.Placement.Constraints
+}
+
+func (c *Controller) recordStatus(service statusview.Service, successful bool) {
+	if c.status == nil {
+		return
+	}
+	if err := c.status.Record(service, successful); err != nil {
+		c.logger.Warn("cannot write service status", "service", service.Name, "service_id", service.ID, "error", err)
+	}
+}
+
+func (c *Controller) removeStatus(serviceID string) {
+	if c.status == nil {
+		return
+	}
+	if err := c.status.Remove(serviceID); err != nil {
+		c.logger.Warn("cannot remove service status", "service_id", serviceID, "error", err)
+	}
 }
 
 func (c *Controller) removeManagedEnvironment(ctx context.Context, service swarm.Service) error {

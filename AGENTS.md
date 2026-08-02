@@ -37,6 +37,8 @@ The project intentionally does not support standalone Docker containers. A singl
 16. A collision between automatically imported and/or explicitly mapped environment names must abort reconciliation before `ServiceUpdate`.
 17. When bootstrap gating is enabled, remove the reserved placement constraint only in the same `ServiceUpdate` that writes a fully resolved environment and controller state.
 18. Any Vault, parsing, mapping, collision, or Docker error must leave the bootstrap gate closed. Never alter operator-owned placement constraints.
+19. Status snapshots may contain service/source/environment names and safe error text, but never secret values, Vault data, RoleID, SecretID, or client tokens.
+20. Failure to write observability state must never fail or delay secret reconciliation.
 
 ## Public label contract
 
@@ -91,6 +93,8 @@ For an enabled service:
 
 For a disabled service with controller state, remove previously managed environment keys and controller state labels. Keep the user's `enabled=false` label and never remove a bootstrap constraint while disabled.
 
+After every tracked-service attempt, record its result in the local status store. Preserve the previous `last_success` timestamp when a later attempt fails. After each successful full Docker service listing, prune records for deleted services. Services without injector configuration or controller state must not remain in the table.
+
 ## Code map
 
 - `cmd/docker-vault-injector/main.go`: dependency wiring, logging, signal handling.
@@ -100,6 +104,7 @@ For a disabled service with controller state, remove previously managed environm
 - `internal/vaultclient`: thin adapter over `github.com/hashicorp/vault/api`.
 - `internal/labels`: public schema, validation, state serialization.
 - `internal/environment`: deterministic Env merge/removal/hash.
+- `internal/status`: atomic secret-free snapshot storage plus terminal table and complete YAML rendering.
 - `examples`: operator-facing examples.
 
 Prefer straightforward functions over generalized repositories, factories, event buses, or plugin systems. Interfaces belong at Docker and Vault boundaries so unit tests can use fakes.
@@ -127,7 +132,7 @@ github.com/moby/moby/api
 
 Do not reintroduce the deprecated monolithic `github.com/docker/docker` import path. Use HashiCorp's official `github.com/hashicorp/vault/api` client.
 
-The module path `github.com/vyktory/docker-vault-injector` is provisional because the repository currently has no Git remote. Change the module declaration and all internal imports together after the final GitHub owner is known.
+The module path `github.com/melichron/docker-vault-injector` is provisional because the repository currently has no Git remote. Change the module declaration and all internal imports together after the final GitHub owner is known.
 
 ## Known limitations and likely next steps
 
@@ -135,6 +140,7 @@ The module path `github.com/vyktory/docker-vault-injector` is provisional becaus
 - One controller replica is expected. Multiple replicas are mostly protected by Docker optimistic locking but can cause noisy conflicts; implement leader election before recommending HA replicas.
 - Reapplying a stack file can cause one rollout from `docker stack deploy` and a second rollout from reinjection.
 - Bootstrap gating prevents uninjected task revisions only when the incoming stack/service specification contains the reserved constraint. The label alone cannot intercept the Swarm scheduler.
+- `docker-vault-injector status` and `status-yaml` read a task-local snapshot. They do not aggregate multiple controller replicas and are temporarily empty after an injector task restart until reconciliation runs.
 - There is no Prometheus metrics or HTTP health endpoint.
 - Docker warnings returned after successful ServiceUpdate are currently ignored by the thin adapter.
 - Full end-to-end tests against a real single-node Swarm and Vault dev server are not present.

@@ -28,6 +28,7 @@ This is a straightforward, functional MVP rather than a finished production rele
 - detection of manual changes to injected environment variables;
 - removal of obsolete managed variables when mappings change;
 - removal of injected variables when `enabled: "false"`;
+- local `status` and `status-yaml` commands showing the last reconciliation result for every managed service;
 - no secret values in controller logs;
 - unit tests for the main scenarios.
 
@@ -258,6 +259,7 @@ The standard environment variables supported by the official Vault Go client are
 | `INJECTOR_RECONCILE_TIMEOUT` | `20s` | Timeout for one Docker/Vault reconciliation |
 | `INJECTOR_EVENT_RETRY_INTERVAL` | `5s` | Delay before reconnecting to Docker events |
 | `INJECTOR_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, or `error` |
+| `INJECTOR_STATUS_FILE` | `/tmp/docker-vault-injector-status.json` | Local snapshot read by the `status` subcommand |
 
 In AppRole mode, the initial login completes before the reconciliation controller starts. The injector then checks the token on schedule, renews it after roughly two-thirds of its issued TTL, and performs a new AppRole login if the token is revoked, expired, non-renewable, or cannot be renewed. RoleID and SecretID files are read again on every login.
 
@@ -283,8 +285,8 @@ If the future GitHub repository uses a module path different from the one in `go
 
 ```bash
 go mod edit -module github.com/OWNER/docker-vault-injector
-rg -l 'github.com/vyktory/docker-vault-injector' --glob '*.go' \
-  | xargs sed -i 's#github.com/vyktory/docker-vault-injector#github.com/OWNER/docker-vault-injector#g'
+rg -l 'github.com/melichron/docker-vault-injector' --glob '*.go' \
+  | xargs sed -i 's#github.com/melichron/docker-vault-injector#github.com/OWNER/docker-vault-injector#g'
 ```
 
 ## Running in Swarm
@@ -345,6 +347,69 @@ docker stack deploy -c examples/postgres-stack.yaml vault-postgres-demo
 
 While the service is waiting for injection, `docker service ps vault-postgres-demo_postgres` reports that no node satisfies the reserved constraint. After successful injection, the gate disappears from the live service, Postgres starts with all three initialization variables, and its named volume retains the initialized database.
 
+## Status command
+
+The running controller writes a small atomic status snapshot inside its own container. Execute the same binary as a second process to render that snapshot as a table; the command does not reconnect to Docker or Vault:
+
+```bash
+docker exec -it INJECTOR_CONTAINER docker-vault-injector status
+```
+
+Swarm task container names are dynamic. One convenient way to locate the current injector task is:
+
+```bash
+injector_container="$(docker ps \
+  --filter label=com.docker.swarm.service.name=vault-injector-demo_injector \
+  --format '{{.ID}}' \
+  | head -n1)"
+
+docker exec -it "$injector_container" docker-vault-injector status
+```
+
+Example output:
+
+```text
+SERVICE                      STATE  GATE    SOURCES   ENVIRONMENT                          VAULT VERSIONS  LAST SUCCESS              ERROR
+vault-injector-demo_api      ready  -       database  DB_HOST,DB_PASSWORD,DB_USER          database=7     2026-08-02T14:10:00+03:00  -
+vault-postgres-demo_postgres error  closed  postgres  POSTGRES_DB,POSTGRES_PASSWORD,...    postgres=3     2026-08-02T14:08:12+03:00  secret source "postgres": Vault unavailable
+```
+
+The snapshot includes service name and ID, state, bootstrap-gate state, source identifiers, environment variable names, Vault versions, timestamps, and the last safe reconciliation error. It never contains environment values, Vault data, RoleID, SecretID, or client tokens.
+
+For the complete machine-readable snapshot, including service IDs and both timestamps, use:
+
+```bash
+docker exec -i INJECTOR_CONTAINER docker-vault-injector status-yaml
+```
+
+Example output:
+
+```yaml
+generated_at: 2026-08-02T11:10:03Z
+services:
+  - id: n4w5b7...
+    name: vault-injector-demo_api
+    state: ready
+    gate: '-'
+    sources:
+      - database
+    environment_names:
+      - DB_HOST
+      - DB_PASSWORD
+      - DB_USER
+    versions:
+      database: 7
+    last_attempt: 2026-08-02T11:10:03Z
+    last_success: 2026-08-02T11:10:03Z
+    error: ""
+```
+
+`status-yaml` writes only YAML to stdout, so its output can be redirected or piped into tools such as `yq`. A TTY is not required, hence the example uses `docker exec -i` instead of `-it`.
+
+Only services carrying injector configuration or controller state are shown. Removed services disappear after the next successful full Docker service listing. The snapshot is local to the current injector task and is recreated after that task restarts.
+
+`INJECTOR_STATUS_FILE` normally does not need to be changed. If the container uses a read-only root filesystem, point it at a small writable mount. Failure to write the status file disables status reporting but never stops reconciliation.
+
 ## Error behavior
 
 The project's fail-safe rule is: **never replace working values with empty values because of a Vault or configuration error**.
@@ -376,6 +441,7 @@ internal/controller/         reconciliation and event loop
 internal/dockerclient/       thin Moby client adapter
 internal/environment/        merge, cleanup and drift hash
 internal/labels/             public label schema and validation
+internal/status/             secret-free local snapshot, table and YAML rendering
 internal/vaultclient/        thin official Vault client adapter
 examples/                    Swarm stack and Vault policy
 ```

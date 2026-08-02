@@ -1,4 +1,4 @@
-module github.com/vyktory/docker-vault-injector
+module github.com/melichron/docker-vault-injector
 
 go 1.26
 
@@ -6,6 +6,7 @@ require (
 	github.com/hashicorp/vault/api v1.23.0
 	github.com/moby/moby/api v1.55.0
 	github.com/moby/moby/client v0.5.1
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

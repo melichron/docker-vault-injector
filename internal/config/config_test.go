@@ -21,3 +21,15 @@ func TestLoadAllowsExplicitTokenFallback(t *testing.T) {
 		t.Fatalf("auth method = %q", configuration.VaultAuth.Method)
 	}
 }
+
+func TestStatusFileFromEnvironment(t *testing.T) {
+	t.Setenv("INJECTOR_STATUS_FILE", "/run/injector/status.json")
+	if got := StatusFileFromEnvironment(); got != "/run/injector/status.json" {
+		t.Fatalf("status file = %q", got)
+	}
+
+	t.Setenv("INJECTOR_STATUS_FILE", "")
+	if got := StatusFileFromEnvironment(); got != DefaultStatusFile {
+		t.Fatalf("default status file = %q", got)
+	}
+}
