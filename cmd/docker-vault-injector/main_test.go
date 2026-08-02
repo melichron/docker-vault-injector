@@ -2,11 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	statusview "github.com/melichron/docker-vault-injector/internal/status"
+	"github.com/melichron/docker-vault-injector/internal/vaultclient"
 )
 
 func TestRunStatusDoesNotRequireControllerConfiguration(t *testing.T) {
@@ -49,5 +55,55 @@ func TestRunStatusDoesNotRequireControllerConfiguration(t *testing.T) {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("status YAML does not contain %q:\n%s", expected, output.String())
 		}
+	}
+}
+
+func TestRunHealthChecksHeartbeatFreshness(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status.json")
+	_, err := statusview.NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := statusview.Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	if err := runHealth(&output, path, time.Minute, snapshot.HeartbeatAt.Add(59*time.Second)); err != nil {
+		t.Fatalf("fresh heartbeat is unhealthy: %v", err)
+	}
+	if output.String() != "healthy\n" {
+		t.Fatalf("health output = %q", output.String())
+	}
+	if err := runHealth(io.Discard, path, time.Minute, snapshot.HeartbeatAt.Add(61*time.Second)); err == nil {
+		t.Fatal("stale heartbeat should fail")
+	}
+}
+
+type retryingAuthenticator struct {
+	attempts int
+}
+
+func (a *retryingAuthenticator) Authenticate(context.Context, vaultclient.AuthConfig) error {
+	a.attempts++
+	if a.attempts < 3 {
+		return errors.New("Vault unavailable")
+	}
+	return nil
+}
+
+func TestInitialVaultAuthenticationRetriesUntilSuccess(t *testing.T) {
+	authenticator := &retryingAuthenticator{}
+	configuration := vaultclient.AuthConfig{
+		AuthRetryInterval: time.Nanosecond,
+		AuthRetryMaximum:  time.Nanosecond,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := authenticateVaultUntilSuccess(context.Background(), authenticator, configuration, logger, nil); err != nil {
+		t.Fatal(err)
+	}
+	if authenticator.attempts != 3 {
+		t.Fatalf("authentication attempts = %d, want 3", authenticator.attempts)
 	}
 }

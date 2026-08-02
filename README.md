@@ -29,10 +29,13 @@ This is a straightforward, functional MVP rather than a finished production rele
 - removal of obsolete managed variables when mappings change;
 - removal of injected variables when `enabled: "false"`;
 - local `status` and `status-yaml` commands showing the last reconciliation result for every managed service;
+- a local `health` command that detects a stalled reconciliation loop without treating Vault outages as process failures;
+- exponential retry backoff with jitter for initial AppRole authentication, re-authentication, and Docker event reconnection;
+- Docker ServiceUpdate warnings in logs and status output;
 - no secret values in controller logs;
 - unit tests for the main scenarios.
 
-Response-wrapped SecretID delivery, leader election for multiple controller replicas, metrics and health endpoints, and full end-to-end tests are not implemented yet.
+Response-wrapped SecretID delivery, leader election for multiple controller replicas, Prometheus metrics, and full end-to-end tests are not implemented yet.
 
 ## How it works
 
@@ -252,16 +255,19 @@ The standard environment variables supported by the official Vault Go client are
 | `VAULT_APPROLE_SECRET_ID` | — | SecretID supplied directly through the environment |
 | `VAULT_APPROLE_SECRET_ID_FILE` | — | File containing SecretID; takes precedence over the environment |
 | `VAULT_TOKEN_CHECK_INTERVAL` | `30s` | Interval between AppRole token checks through `lookup-self` |
-| `VAULT_AUTH_RETRY_INTERVAL` | `5s` | Delay between failed AppRole login attempts |
+| `VAULT_AUTH_RETRY_INTERVAL` | `5s` | Initial delay after a failed AppRole login |
+| `VAULT_AUTH_RETRY_MAX_INTERVAL` | `1m` | Maximum AppRole retry delay, including jitter |
 | `VAULT_TOKEN` | — | Static token used when `VAULT_AUTH_METHOD=token` |
 | `VAULT_TOKEN_FILE` | — | File containing a static token; takes precedence over `VAULT_TOKEN` |
 | `INJECTOR_POLL_INTERVAL` | `30s` | Full reconciliation interval |
 | `INJECTOR_RECONCILE_TIMEOUT` | `20s` | Timeout for one Docker/Vault reconciliation |
-| `INJECTOR_EVENT_RETRY_INTERVAL` | `5s` | Delay before reconnecting to Docker events |
+| `INJECTOR_EVENT_RETRY_INTERVAL` | `5s` | Initial delay before reconnecting to Docker events |
+| `INJECTOR_EVENT_RETRY_MAX_INTERVAL` | `1m` | Maximum Docker event reconnect delay, including jitter |
 | `INJECTOR_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, or `error` |
 | `INJECTOR_STATUS_FILE` | `/tmp/docker-vault-injector-status.json` | Local snapshot read by the `status` subcommand |
+| `INJECTOR_HEALTH_MAX_AGE` | `1m20s` | Maximum accepted controller heartbeat age for `health` |
 
-In AppRole mode, the initial login completes before the reconciliation controller starts. The injector then checks the token on schedule, renews it after roughly two-thirds of its issued TTL, and performs a new AppRole login if the token is revoked, expired, non-renewable, or cannot be renewed. RoleID and SecretID files are read again on every login.
+In AppRole mode, the initial login completes before reconciliation starts. A failed initial login is retried indefinitely with exponential backoff and jitter rather than terminating the process. The injector then checks the token on schedule, renews it after roughly two-thirds of its issued TTL, and performs a new AppRole login if the token is revoked, expired, non-renewable, or cannot be renewed. RoleID and SecretID files are read again on every login.
 
 The `token` mode remains available for development and emergency diagnostics. It validates the static token at startup but intentionally does not manage its lifecycle.
 
@@ -279,14 +285,6 @@ To build the container image:
 
 ```bash
 make docker-build
-```
-
-If the future GitHub repository uses a module path different from the one in `go.mod`, change it before the first release:
-
-```bash
-go mod edit -module github.com/OWNER/docker-vault-injector
-rg -l 'github.com/melichron/docker-vault-injector' --glob '*.go' \
-  | xargs sed -i 's#github.com/melichron/docker-vault-injector#github.com/OWNER/docker-vault-injector#g'
 ```
 
 ## Running in Swarm
@@ -369,14 +367,14 @@ docker exec -it "$injector_container" docker-vault-injector status
 Example output:
 
 ```text
-SERVICE                      STATE  GATE    SOURCES   ENVIRONMENT                          VAULT VERSIONS  LAST SUCCESS              ERROR
-vault-injector-demo_api      ready  -       database  DB_HOST,DB_PASSWORD,DB_USER          database=7     2026-08-02T14:10:00+03:00  -
-vault-postgres-demo_postgres error  closed  postgres  POSTGRES_DB,POSTGRES_PASSWORD,...    postgres=3     2026-08-02T14:08:12+03:00  secret source "postgres": Vault unavailable
+SERVICE                      STATE  GATE    SOURCES   ENVIRONMENT                          VAULT VERSIONS  LAST SUCCESS              ERROR                                                WARNINGS
+vault-injector-demo_api      ready  -       database  DB_HOST,DB_PASSWORD,DB_USER          database=7     2026-08-02T14:10:00+03:00  -                                                    -
+vault-postgres-demo_postgres error  closed  postgres  POSTGRES_DB,POSTGRES_PASSWORD,...    postgres=3     2026-08-02T14:08:12+03:00  secret source "postgres": Vault unavailable          -
 ```
 
-The snapshot includes service name and ID, state, bootstrap-gate state, source identifiers, environment variable names, Vault versions, timestamps, and the last safe reconciliation error. It never contains environment values, Vault data, RoleID, SecretID, or client tokens.
+The snapshot includes service name and ID, state, bootstrap-gate state, source identifiers, environment variable names, Vault versions, timestamps, the last safe reconciliation error, and Docker update warnings. It never contains environment values, Vault data, RoleID, SecretID, or client tokens.
 
-For the complete machine-readable snapshot, including service IDs and both timestamps, use:
+For the complete machine-readable snapshot, including service IDs and all timestamps, use:
 
 ```bash
 docker exec -i INJECTOR_CONTAINER docker-vault-injector status-yaml
@@ -386,6 +384,7 @@ Example output:
 
 ```yaml
 generated_at: 2026-08-02T11:10:03Z
+heartbeat_at: 2026-08-02T11:10:03Z
 services:
   - id: n4w5b7...
     name: vault-injector-demo_api
@@ -402,9 +401,20 @@ services:
     last_attempt: 2026-08-02T11:10:03Z
     last_success: 2026-08-02T11:10:03Z
     error: ""
+    warnings: []
 ```
 
 `status-yaml` writes only YAML to stdout, so its output can be redirected or piped into tools such as `yq`. A TTY is not required, hence the example uses `docker exec -i` instead of `-it`.
+
+The same heartbeat supports a local liveness check:
+
+```bash
+docker exec -i INJECTOR_CONTAINER docker-vault-injector health
+```
+
+It prints `healthy` and exits with status zero while the controller loop is making progress. A missing or stale heartbeat produces a non-zero exit status. Individual reconciliation errors and Vault outages do not make the process unhealthy, preventing dependency failures from causing a restart storm. Both example stacks use this command as the injector task healthcheck.
+
+Set `INJECTOR_HEALTH_MAX_AGE` higher than custom polling, reconciliation, or authentication retry intervals. The default `1m20s` covers the default timings.
 
 Only services carrying injector configuration or controller state are shown. Removed services disappear after the next successful full Docker service listing. The snapshot is local to the current injector task and is recreated after that task restarts.
 
@@ -417,6 +427,8 @@ The project's fail-safe rule is: **never replace working values with empty value
 If Vault is unavailable, a version has been deleted, a field is missing, or a mapping is invalid, `ServiceSpec` remains unchanged and the error is logged without secret values. The next Docker event or periodic reconciliation retries the operation.
 
 If another process changes the service between `ServiceInspect` and `ServiceUpdate`, Docker rejects the stale `Version.Index`. The controller does not overwrite newer state; the next event or reconciliation starts again from a fresh inspection.
+
+Initial Vault authentication, later AppRole re-authentication, and Docker event-stream reconnection use exponential backoff with up to 20 percent jitter. Successful long-lived operation resets the corresponding backoff. Docker warnings returned after successful service updates are logged and retained in status until the next successful service update.
 
 ## Interaction with `docker stack deploy`
 
@@ -441,6 +453,7 @@ internal/controller/         reconciliation and event loop
 internal/dockerclient/       thin Moby client adapter
 internal/environment/        merge, cleanup and drift hash
 internal/labels/             public label schema and validation
+internal/retry/              exponential retry timing with jitter
 internal/status/             secret-free local snapshot, table and YAML rendering
 internal/vaultclient/        thin official Vault client adapter
 examples/                    Swarm stack and Vault policy

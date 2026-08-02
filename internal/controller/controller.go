@@ -22,6 +22,7 @@ import (
 
 	"github.com/melichron/docker-vault-injector/internal/environment"
 	"github.com/melichron/docker-vault-injector/internal/labels"
+	"github.com/melichron/docker-vault-injector/internal/retry"
 	statusview "github.com/melichron/docker-vault-injector/internal/status"
 	"github.com/melichron/docker-vault-injector/internal/vaultclient"
 )
@@ -29,7 +30,7 @@ import (
 type Docker interface {
 	ListServices(ctx context.Context) ([]swarm.Service, error)
 	InspectService(ctx context.Context, id string) (swarm.Service, error)
-	UpdateService(ctx context.Context, service swarm.Service) error
+	UpdateService(ctx context.Context, service swarm.Service) ([]string, error)
 	WatchServiceEvents(ctx context.Context) (<-chan events.Message, <-chan error)
 }
 
@@ -45,6 +46,7 @@ type Controller struct {
 	pollInterval       time.Duration
 	reconcileTimeout   time.Duration
 	eventRetryInterval time.Duration
+	eventRetryMaximum  time.Duration
 	status             *statusview.Store
 }
 
@@ -55,6 +57,7 @@ func New(
 	pollInterval time.Duration,
 	reconcileTimeout time.Duration,
 	eventRetryInterval time.Duration,
+	eventRetryMaximum time.Duration,
 	statusStore *statusview.Store,
 ) *Controller {
 	return &Controller{
@@ -64,6 +67,7 @@ func New(
 		pollInterval:       pollInterval,
 		reconcileTimeout:   reconcileTimeout,
 		eventRetryInterval: eventRetryInterval,
+		eventRetryMaximum:  eventRetryMaximum,
 		status:             statusStore,
 	}
 }
@@ -75,6 +79,7 @@ func New(
 func (c *Controller) Run(ctx context.Context) error {
 	triggers := make(chan string, 128)
 	go c.watchEvents(ctx, triggers)
+	c.touchStatus()
 
 	c.reconcileAllWithLogging(ctx, "startup")
 
@@ -86,8 +91,10 @@ func (c *Controller) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case serviceID := <-triggers:
+			c.touchStatus()
 			c.reconcileIDWithLogging(ctx, serviceID, "docker-event")
 		case <-ticker.C:
+			c.touchStatus()
 			c.reconcileAllWithLogging(ctx, "periodic-resync")
 		}
 	}
@@ -96,7 +103,10 @@ func (c *Controller) Run(ctx context.Context) error {
 // watchEvents reconnects forever. It uses a non-blocking send because a burst
 // of service updates can safely collapse into the next periodic reconciliation.
 func (c *Controller) watchEvents(ctx context.Context, triggers chan<- string) {
+	reconnectBackoff := retry.NewBackoff(c.eventRetryInterval, c.eventRetryMaximum)
 	for ctx.Err() == nil {
+		streamStarted := time.Now()
+		receivedEvent := false
 		messages, errorsChannel := c.docker.WatchServiceEvents(ctx)
 		streamEnded := false
 
@@ -112,6 +122,7 @@ func (c *Controller) watchEvents(ctx context.Context, triggers chan<- string) {
 				if event.Actor.ID == "" {
 					continue
 				}
+				receivedEvent = true
 				select {
 				case triggers <- event.Actor.ID:
 				default:
@@ -125,13 +136,19 @@ func (c *Controller) watchEvents(ctx context.Context, triggers chan<- string) {
 			}
 		}
 
-		if !waitForContext(ctx, c.eventRetryInterval) {
+		if receivedEvent || time.Since(streamStarted) >= c.eventRetryInterval {
+			reconnectBackoff.Reset()
+		}
+		delay := reconnectBackoff.Next()
+		c.logger.Debug("reconnecting Docker event stream", "retry_after", delay)
+		if !waitForContext(ctx, delay) {
 			return
 		}
 	}
 }
 
 func (c *Controller) reconcileAllWithLogging(parent context.Context, reason string) {
+	c.touchStatus()
 	listContext, cancelList := context.WithTimeout(parent, c.reconcileTimeout)
 	services, err := c.docker.ListServices(listContext)
 	cancelList()
@@ -157,12 +174,14 @@ func (c *Controller) reconcileAllWithLogging(parent context.Context, reason stri
 				"error", err,
 			)
 		}
+		c.touchStatus()
 	}
 	if c.status != nil {
 		if err := c.status.Prune(activeServiceIDs); err != nil {
 			c.logger.Warn("cannot prune status snapshot", "error", err)
 		}
 	}
+	c.touchStatus()
 }
 
 func (c *Controller) reconcileIDWithLogging(parent context.Context, serviceID, reason string) {
@@ -221,7 +240,10 @@ func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service
 	}
 	if !configuration.Enabled {
 		report.State = statusview.StateDisabled
-		return c.removeManagedEnvironment(ctx, service)
+		warnings, updated, err := c.removeManagedEnvironment(ctx, service)
+		report.Warnings = warnings
+		report.UpdateAttempted = updated
+		return err
 	}
 	report.Sources = sortedSourceNames(configuration.Secrets)
 	if configuration.BootstrapGate && report.Gate != statusview.GateClosed {
@@ -359,9 +381,13 @@ func (c *Controller) ReconcileService(ctx context.Context, service swarm.Service
 		return nil
 	}
 
-	if err := c.docker.UpdateService(ctx, updated); err != nil {
+	warnings, err := c.docker.UpdateService(ctx, updated)
+	if err != nil {
 		return err
 	}
+	report.Warnings = warnings
+	report.UpdateAttempted = true
+	c.logDockerWarnings(service, warnings)
 	if bootstrapGateRemoved {
 		report.Gate = statusview.GateOpen
 	}
@@ -400,17 +426,36 @@ func (c *Controller) removeStatus(serviceID string) {
 	}
 }
 
-func (c *Controller) removeManagedEnvironment(ctx context.Context, service swarm.Service) error {
+func (c *Controller) touchStatus() {
+	if c.status == nil {
+		return
+	}
+	if err := c.status.Heartbeat(); err != nil {
+		c.logger.Warn("cannot write controller heartbeat", "error", err)
+	}
+}
+
+func (c *Controller) logDockerWarnings(service swarm.Service, warnings []string) {
+	for _, warning := range warnings {
+		c.logger.Warn("Docker accepted the service update with a warning",
+			"service", service.Spec.Name,
+			"service_id", service.ID,
+			"warning", warning,
+		)
+	}
+}
+
+func (c *Controller) removeManagedEnvironment(ctx context.Context, service swarm.Service) ([]string, bool, error) {
 	if !labels.HasControllerState(service.Spec.Labels) {
-		return nil
+		return nil, false, nil
 	}
 	if service.Spec.TaskTemplate.ContainerSpec == nil {
-		return fmt.Errorf("cannot clean controller state from a service without a container task specification")
+		return nil, false, fmt.Errorf("cannot clean controller state from a service without a container task specification")
 	}
 
 	managed, err := labels.ParseManagedEnvironment(service.Spec.Labels)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 	updated := cloneServiceForUpdate(service)
 	updated.Spec.TaskTemplate.ContainerSpec.Env = environment.Remove(
@@ -422,15 +467,17 @@ func (c *Controller) removeManagedEnvironment(ctx context.Context, service swarm
 	delete(updated.Spec.Labels, labels.StateHashLabel)
 	delete(updated.Spec.Labels, labels.ConfigHashLabel)
 
-	if err := c.docker.UpdateService(ctx, updated); err != nil {
-		return err
+	warnings, err := c.docker.UpdateService(ctx, updated)
+	if err != nil {
+		return nil, false, err
 	}
+	c.logDockerWarnings(service, warnings)
 	c.logger.Info("removed Vault-managed environment",
 		"service", service.Spec.Name,
 		"service_id", service.ID,
 		"environment_names", managed,
 	)
-	return nil
+	return warnings, true, nil
 }
 
 // cloneServiceForUpdate copies exactly the mutable map, pointer, and slice that

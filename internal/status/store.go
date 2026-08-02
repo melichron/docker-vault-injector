@@ -43,10 +43,13 @@ type Service struct {
 	LastAttempt      time.Time      `json:"last_attempt" yaml:"last_attempt"`
 	LastSuccess      *time.Time     `json:"last_success,omitempty" yaml:"last_success"`
 	Error            string         `json:"error,omitempty" yaml:"error"`
+	Warnings         []string       `json:"warnings,omitempty" yaml:"warnings"`
+	UpdateAttempted  bool           `json:"-" yaml:"-"`
 }
 
 type Snapshot struct {
 	GeneratedAt time.Time `json:"generated_at" yaml:"generated_at"`
+	HeartbeatAt time.Time `json:"heartbeat_at" yaml:"heartbeat_at"`
 	Services    []Service `json:"services" yaml:"services"`
 }
 
@@ -55,10 +58,11 @@ type Snapshot struct {
 // either the previous complete file or the next complete file, never partial
 // JSON.
 type Store struct {
-	mu       sync.Mutex
-	path     string
-	services map[string]Service
-	now      func() time.Time
+	mu        sync.Mutex
+	path      string
+	services  map[string]Service
+	heartbeat time.Time
+	now       func() time.Time
 }
 
 func NewStore(path string) (*Store, error) {
@@ -71,6 +75,7 @@ func NewStore(path string) (*Store, error) {
 		services: make(map[string]Service),
 		now:      time.Now,
 	}
+	store.heartbeat = store.now().UTC()
 	if err := store.writeLocked(); err != nil {
 		return nil, err
 	}
@@ -94,7 +99,23 @@ func (s *Store) Record(service Service, successful bool) error {
 	service.Sources = sortedCopy(service.Sources)
 	service.EnvironmentNames = sortedCopy(service.EnvironmentNames)
 	service.Versions = cloneVersions(service.Versions)
+	if previous, exists := s.services[service.ID]; exists && !service.UpdateAttempted {
+		service.Warnings = append([]string(nil), previous.Warnings...)
+	} else {
+		service.Warnings = append([]string(nil), service.Warnings...)
+	}
 	s.services[service.ID] = service
+	s.heartbeat = now
+	return s.writeLocked()
+}
+
+// Heartbeat proves that the controller's main reconciliation loop is still
+// making progress even when there are no injector-managed services. It is
+// intentionally independent from whether Docker or Vault operations succeed.
+func (s *Store) Heartbeat() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.heartbeat = s.now().UTC()
 	return s.writeLocked()
 }
 
@@ -174,7 +195,11 @@ func (s *Store) snapshotLocked() Snapshot {
 		}
 		return services[i].Name < services[j].Name
 	})
-	return Snapshot{GeneratedAt: s.now().UTC(), Services: services}
+	return Snapshot{
+		GeneratedAt: s.now().UTC(),
+		HeartbeatAt: s.heartbeat,
+		Services:    services,
+	}
 }
 
 func Read(path string) (Snapshot, error) {
@@ -191,6 +216,23 @@ func Read(path string) (Snapshot, error) {
 	return snapshot, nil
 }
 
+// CheckHealth validates only liveness of the controller loop. Service errors
+// and temporary Vault outages do not make the process unhealthy and therefore
+// cannot trigger a restart storm.
+func CheckHealth(snapshot Snapshot, maximumAge time.Duration, now time.Time) error {
+	if maximumAge <= 0 {
+		return fmt.Errorf("health maximum age must be greater than zero")
+	}
+	if snapshot.HeartbeatAt.IsZero() {
+		return fmt.Errorf("controller heartbeat has not been recorded")
+	}
+	age := now.Sub(snapshot.HeartbeatAt)
+	if age > maximumAge {
+		return fmt.Errorf("controller heartbeat is stale: age %s exceeds %s", age.Round(time.Second), maximumAge)
+	}
+	return nil
+}
+
 func WriteTable(writer io.Writer, snapshot Snapshot) error {
 	if len(snapshot.Services) == 0 {
 		_, err := fmt.Fprintln(writer, "No injector-managed services have been observed yet.")
@@ -198,7 +240,7 @@ func WriteTable(writer io.Writer, snapshot Snapshot) error {
 	}
 
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "SERVICE\tSTATE\tGATE\tSOURCES\tENVIRONMENT\tVAULT VERSIONS\tLAST SUCCESS\tERROR"); err != nil {
+	if _, err := fmt.Fprintln(table, "SERVICE\tSTATE\tGATE\tSOURCES\tENVIRONMENT\tVAULT VERSIONS\tLAST SUCCESS\tERROR\tWARNINGS"); err != nil {
 		return err
 	}
 	for _, service := range snapshot.Services {
@@ -206,7 +248,7 @@ func WriteTable(writer io.Writer, snapshot Snapshot) error {
 		if service.LastSuccess != nil {
 			lastSuccess = service.LastSuccess.Local().Format(time.RFC3339)
 		}
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			service.Name,
 			service.State,
 			service.Gate,
@@ -215,6 +257,7 @@ func WriteTable(writer io.Writer, snapshot Snapshot) error {
 			formatVersions(service.Versions),
 			lastSuccess,
 			valueOrDash(singleLine(service.Error)),
+			valueOrDash(singleLine(strings.Join(service.Warnings, "; "))),
 		); err != nil {
 			return err
 		}

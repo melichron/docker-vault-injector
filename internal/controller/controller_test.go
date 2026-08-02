@@ -21,7 +21,8 @@ import (
 )
 
 type fakeDocker struct {
-	updates []swarm.Service
+	updates  []swarm.Service
+	warnings []string
 }
 
 func (d *fakeDocker) ListServices(context.Context) ([]swarm.Service, error) {
@@ -32,9 +33,9 @@ func (d *fakeDocker) InspectService(context.Context, string) (swarm.Service, err
 	return swarm.Service{}, nil
 }
 
-func (d *fakeDocker) UpdateService(_ context.Context, service swarm.Service) error {
+func (d *fakeDocker) UpdateService(_ context.Context, service swarm.Service) ([]string, error) {
 	d.updates = append(d.updates, service)
-	return nil
+	return d.warnings, nil
 }
 
 func (d *fakeDocker) WatchServiceEvents(context.Context) (<-chan events.Message, <-chan error) {
@@ -145,7 +146,7 @@ func TestStatusSnapshotRecordsResultsWithoutSecretValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	docker := &fakeDocker{}
+	docker := &fakeDocker{warnings: []string{"registry auth was not updated"}}
 	vault := &fakeVault{
 		versions: map[string]int{"kv/apps/api": 7},
 		secrets: map[string]vaultclient.Secret{
@@ -186,6 +187,9 @@ func TestStatusSnapshotRecordsResultsWithoutSecretValues(t *testing.T) {
 	if serviceStatus.Versions["database"] != 7 || serviceStatus.LastSuccess == nil {
 		t.Fatalf("unexpected successful status: %#v", serviceStatus)
 	}
+	if !slices.Equal(serviceStatus.Warnings, []string{"registry auth was not updated"}) {
+		t.Fatalf("Docker warnings = %v", serviceStatus.Warnings)
+	}
 
 	vault.currentVersionError = errors.New("Vault unavailable")
 	if err := controller.ReconcileService(context.Background(), docker.updates[0]); err == nil {
@@ -201,6 +205,9 @@ func TestStatusSnapshotRecordsResultsWithoutSecretValues(t *testing.T) {
 	}
 	if serviceStatus.LastSuccess == nil {
 		t.Fatal("failed reconciliation erased the last successful timestamp")
+	}
+	if !slices.Equal(serviceStatus.Warnings, []string{"registry auth was not updated"}) {
+		t.Fatalf("failed reconciliation erased the last Docker warnings: %v", serviceStatus.Warnings)
 	}
 }
 
@@ -543,6 +550,7 @@ func testControllerWithStatus(docker Docker, vault Vault, statusStore *statusvie
 		time.Minute,
 		time.Minute,
 		time.Second,
+		time.Minute,
 		statusStore,
 	)
 }

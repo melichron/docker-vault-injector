@@ -13,6 +13,8 @@ import (
 	"time"
 
 	vault "github.com/hashicorp/vault/api"
+
+	"github.com/melichron/docker-vault-injector/internal/retry"
 )
 
 const (
@@ -39,6 +41,7 @@ type AuthConfig struct {
 	TokenFile           string
 	TokenCheckInterval  time.Duration
 	AuthRetryInterval   time.Duration
+	AuthRetryMaximum    time.Duration
 }
 
 type tokenLease struct {
@@ -90,6 +93,13 @@ func (c *Client) Authenticate(ctx context.Context, configuration AuthConfig) err
 		}
 		if configuration.AuthRetryInterval <= 0 {
 			return fmt.Errorf("Vault auth retry interval must be greater than zero")
+		}
+		if configuration.AuthRetryMaximum == 0 {
+			configuration.AuthRetryMaximum = configuration.AuthRetryInterval
+			c.auth.AuthRetryMaximum = configuration.AuthRetryMaximum
+		}
+		if configuration.AuthRetryMaximum < configuration.AuthRetryInterval {
+			return fmt.Errorf("Vault auth retry maximum must be greater than or equal to the initial interval")
 		}
 
 		secret, err := c.loginAppRole(ctx)
@@ -207,6 +217,7 @@ func (c *Client) RunTokenLifecycle(ctx context.Context, logger *slog.Logger) {
 }
 
 func (c *Client) reauthenticateUntilSuccess(ctx context.Context, logger *slog.Logger) bool {
+	backoff := retry.NewBackoff(c.auth.AuthRetryInterval, c.auth.AuthRetryMaximum)
 	for ctx.Err() == nil {
 		secret, err := c.loginAppRole(ctx)
 		if err == nil {
@@ -224,12 +235,13 @@ func (c *Client) reauthenticateUntilSuccess(ctx context.Context, logger *slog.Lo
 			}
 		}
 
+		delay := backoff.Next()
 		logger.Error("AppRole authentication failed; will retry",
 			"auth_path", c.auth.AppRoleAuthPath,
-			"retry_after", c.auth.AuthRetryInterval,
+			"retry_after", delay,
 			"error", err,
 		)
-		if !waitForContext(ctx, c.auth.AuthRetryInterval) {
+		if !waitForContext(ctx, delay) {
 			return false
 		}
 	}

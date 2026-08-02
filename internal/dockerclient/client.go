@@ -43,16 +43,16 @@ func (c *Client) InspectService(ctx context.Context, id string) (swarm.Service, 
 	return result.Service, nil
 }
 
-func (c *Client) UpdateService(ctx context.Context, service swarm.Service) error {
-	_, err := c.client.ServiceUpdate(ctx, service.ID, moby.ServiceUpdateOptions{
+func (c *Client) UpdateService(ctx context.Context, service swarm.Service) ([]string, error) {
+	result, err := c.client.ServiceUpdate(ctx, service.ID, moby.ServiceUpdateOptions{
 		Version:          service.Version,
 		Spec:             service.Spec,
 		RegistryAuthFrom: swarm.RegistryAuthFromSpec,
 	})
 	if err != nil {
-		return fmt.Errorf("update Swarm service %s at version %s: %w", service.ID, service.Version.String(), err)
+		return nil, fmt.Errorf("update Swarm service %s at version %s: %w", service.ID, service.Version.String(), err)
 	}
-	return nil
+	return result.Warnings, nil
 }
 
 // WatchServiceEvents creates one event stream. The controller reconnects when

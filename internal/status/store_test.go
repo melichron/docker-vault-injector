@@ -72,6 +72,7 @@ func TestWriteTableIsDeterministicAndSingleLine(t *testing.T) {
 			Versions:         map[string]int{"database": 7, "common": 3},
 			LastSuccess:      &lastSuccess,
 			Error:            "Vault\n  unavailable",
+			Warnings:         []string{"registry auth was not updated"},
 		},
 	}}
 
@@ -86,6 +87,7 @@ func TestWriteTableIsDeterministicAndSingleLine(t *testing.T) {
 		"common=3,database=7",
 		"DB_USER,DB_PASSWORD",
 		"Vault unavailable",
+		"registry auth was not updated",
 	} {
 		if !strings.Contains(rendered, expected) {
 			t.Fatalf("table does not contain %q:\n%s", expected, rendered)
@@ -101,6 +103,7 @@ func TestWriteYAMLIncludesCompleteStatus(t *testing.T) {
 	lastSuccess := time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC)
 	snapshot := Snapshot{
 		GeneratedAt: lastAttempt,
+		HeartbeatAt: lastAttempt,
 		Services: []Service{{
 			ID:               "service-id",
 			Name:             "stack_api",
@@ -112,6 +115,7 @@ func TestWriteYAMLIncludesCompleteStatus(t *testing.T) {
 			LastAttempt:      lastAttempt,
 			LastSuccess:      &lastSuccess,
 			Error:            "Vault unavailable",
+			Warnings:         []string{"warning one"},
 		}},
 	}
 
@@ -121,6 +125,7 @@ func TestWriteYAMLIncludesCompleteStatus(t *testing.T) {
 	}
 	for _, expected := range []string{
 		"generated_at: 2026-08-02T10:01:00Z",
+		"heartbeat_at: 2026-08-02T10:01:00Z",
 		"id: service-id",
 		"name: stack_api",
 		"state: error",
@@ -131,10 +136,81 @@ func TestWriteYAMLIncludesCompleteStatus(t *testing.T) {
 		"last_attempt: 2026-08-02T10:01:00Z",
 		"last_success: 2026-08-02T10:00:00Z",
 		"error: Vault unavailable",
+		"- warning one",
 	} {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("YAML does not contain %q:\n%s", expected, output.String())
 		}
+	}
+}
+
+func TestHeartbeatAndHealthCheck(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status.json")
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+	if err := store.Heartbeat(); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.HeartbeatAt.Equal(now) {
+		t.Fatalf("heartbeat = %v, want %v", snapshot.HeartbeatAt, now)
+	}
+	if err := CheckHealth(snapshot, time.Minute, now.Add(59*time.Second)); err != nil {
+		t.Fatalf("fresh heartbeat is unhealthy: %v", err)
+	}
+	if err := CheckHealth(snapshot, time.Minute, now.Add(61*time.Second)); err == nil {
+		t.Fatal("stale heartbeat should be unhealthy")
+	}
+}
+
+func TestStoreKeepsWarningsUntilNextSuccessfulServiceUpdate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status.json")
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := Service{
+		ID:              "service-id",
+		Name:            "stack_api",
+		State:           StateReady,
+		Gate:            GateNotUsed,
+		Warnings:        []string{"daemon warning"},
+		UpdateAttempted: true,
+	}
+	if err := store.Record(service, true); err != nil {
+		t.Fatal(err)
+	}
+	service.Warnings = nil
+	service.UpdateAttempted = false
+	if err := store.Record(service, true); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(snapshot.Services[0].Warnings, " "), "daemon warning") {
+		t.Fatalf("no-op reconciliation erased warnings: %v", snapshot.Services[0].Warnings)
+	}
+
+	service.UpdateAttempted = true
+	if err := store.Record(service, true); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Services[0].Warnings) != 0 {
+		t.Fatalf("clean service update did not clear warnings: %v", snapshot.Services[0].Warnings)
 	}
 }
 

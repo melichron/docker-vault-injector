@@ -10,12 +10,17 @@ import (
 	"time"
 )
 
-const DefaultStatusFile = "/tmp/docker-vault-injector-status.json"
+const (
+	DefaultStatusFile   = "/tmp/docker-vault-injector-status.json"
+	DefaultHealthMaxAge = 80 * time.Second
+)
 
 type Config struct {
 	PollInterval       time.Duration
 	ReconcileTimeout   time.Duration
 	EventRetryInterval time.Duration
+	EventRetryMaximum  time.Duration
+	HealthMaxAge       time.Duration
 	StatusFile         string
 	VaultAuth          VaultAuthConfig
 	LogLevel           slog.Level
@@ -35,6 +40,7 @@ type VaultAuthConfig struct {
 	TokenFile           string
 	TokenCheckInterval  time.Duration
 	AuthRetryInterval   time.Duration
+	AuthRetryMaximum    time.Duration
 }
 
 func Load() (Config, error) {
@@ -50,11 +56,23 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	eventRetryMaximum, err := durationFromEnvironment("INJECTOR_EVENT_RETRY_MAX_INTERVAL", time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	healthMaxAge, err := HealthMaxAgeFromEnvironment()
+	if err != nil {
+		return Config{}, err
+	}
 	tokenCheckInterval, err := durationFromEnvironment("VAULT_TOKEN_CHECK_INTERVAL", 30*time.Second)
 	if err != nil {
 		return Config{}, err
 	}
 	authRetryInterval, err := durationFromEnvironment("VAULT_AUTH_RETRY_INTERVAL", 5*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	authRetryMaximum, err := durationFromEnvironment("VAULT_AUTH_RETRY_MAX_INTERVAL", time.Minute)
 	if err != nil {
 		return Config{}, err
 	}
@@ -73,8 +91,15 @@ func Load() (Config, error) {
 	}
 
 	if pollInterval <= 0 || reconcileTimeout <= 0 || eventRetryInterval <= 0 ||
-		tokenCheckInterval <= 0 || authRetryInterval <= 0 {
+		eventRetryMaximum <= 0 || healthMaxAge <= 0 || tokenCheckInterval <= 0 ||
+		authRetryInterval <= 0 || authRetryMaximum <= 0 {
 		return Config{}, fmt.Errorf("all duration settings must be greater than zero")
+	}
+	if eventRetryMaximum < eventRetryInterval {
+		return Config{}, fmt.Errorf("INJECTOR_EVENT_RETRY_MAX_INTERVAL must be greater than or equal to INJECTOR_EVENT_RETRY_INTERVAL")
+	}
+	if authRetryMaximum < authRetryInterval {
+		return Config{}, fmt.Errorf("VAULT_AUTH_RETRY_MAX_INTERVAL must be greater than or equal to VAULT_AUTH_RETRY_INTERVAL")
 	}
 
 	authMethod := strings.ToLower(strings.TrimSpace(os.Getenv("VAULT_AUTH_METHOD")))
@@ -92,6 +117,8 @@ func Load() (Config, error) {
 		PollInterval:       pollInterval,
 		ReconcileTimeout:   reconcileTimeout,
 		EventRetryInterval: eventRetryInterval,
+		EventRetryMaximum:  eventRetryMaximum,
+		HealthMaxAge:       healthMaxAge,
 		StatusFile:         StatusFileFromEnvironment(),
 		VaultAuth: VaultAuthConfig{
 			Method:              authMethod,
@@ -104,6 +131,7 @@ func Load() (Config, error) {
 			TokenFile:           os.Getenv("VAULT_TOKEN_FILE"),
 			TokenCheckInterval:  tokenCheckInterval,
 			AuthRetryInterval:   authRetryInterval,
+			AuthRetryMaximum:    authRetryMaximum,
 		},
 		LogLevel: level,
 	}, nil
@@ -117,6 +145,14 @@ func StatusFileFromEnvironment() string {
 		return value
 	}
 	return DefaultStatusFile
+}
+
+// HealthMaxAgeFromEnvironment remains independent from Load for the same
+// reason as StatusFileFromEnvironment: the health subprocess must not require
+// Vault credentials. The default covers two normal polling periods plus one
+// reconciliation timeout.
+func HealthMaxAgeFromEnvironment() (time.Duration, error) {
+	return durationFromEnvironment("INJECTOR_HEALTH_MAX_AGE", DefaultHealthMaxAge)
 }
 
 func durationFromEnvironment(name string, fallback time.Duration) (time.Duration, error) {
