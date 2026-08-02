@@ -74,7 +74,7 @@ node.labels.io.github.docker-vault-injector.gate==open
 
 No node may carry the matching `io.github.docker-vault-injector.gate=open` label. The controller owns only this exact reserved constraint. It preserves every other constraint, removes the gate atomically with successful injection, and never removes it while injection is disabled or failing. The gate and `bootstrap-gate=true` should remain in the stack file so every subsequent `docker stack deploy` is gated as well.
 
-The old multiline `io.github.docker-vault-injector.secrets` JSON label is not supported. This is currently a pre-release project, so the flat schema intentionally replaced it instead of adding a compatibility parser. Any future schema change is a public API change and needs an explicit migration story.
+The old multiline `io.github.docker-vault-injector.secrets` JSON label is not supported. The flat label schema is the supported public contract. Any future schema change is a public API change and needs an explicit migration story.
 
 ## Reconciliation algorithm
 

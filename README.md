@@ -8,9 +8,9 @@ The project supports both multi-node clusters and single-node Swarm installation
 docker swarm init
 ```
 
-## Current status
+## Features
 
-This is a straightforward, functional MVP rather than a finished production release. It currently provides:
+The controller currently provides:
 
 - a Docker service event stream for reacting quickly to service creation and updates;
 - periodic full reconciliation in case events are missed;
