@@ -20,11 +20,12 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     -o /out/docker-vault-injector ./cmd/docker-vault-injector
 
 FROM scratch
+ENV PATH=/bin
 
 # Vault should use HTTPS in production. The CA bundle is needed for public CAs;
 # private CAs can additionally be mounted and selected with VAULT_CACERT.
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=build /out/docker-vault-injector /docker-vault-injector
+COPY --from=build /out/docker-vault-injector /bin/docker-vault-injector
 
-ENTRYPOINT ["/docker-vault-injector"]
+ENTRYPOINT ["/bin/docker-vault-injector"]
 
