@@ -16,15 +16,28 @@ services:
       VAULT_AUTH_METHOD: "approle"
       # This is the full Vault API mount path, but without the /login suffix.
       VAULT_APPROLE_AUTH_PATH: "auth/docker-swarm"
-      VAULT_APPROLE_ROLE_ID_FILE: "/run/secrets/vault_approle_role_id"
-      VAULT_APPROLE_SECRET_ID_FILE: "/run/secrets/vault_approle_secret_id"
-      # AppRole credentials may alternatively be passed directly. Files are
-      # preferred because the injector re-reads them before every login.
+
+      # # AppRole credentials may be passed directly. Files are
+      # # preferred because the injector re-reads them before every login.
       # VAULT_APPROLE_ROLE_ID: "yyyyyyyy-gggg-1111-tttt-123456789abc"
       # VAULT_APPROLE_SECRET_ID: "xxxxxxxx-gggg-1111-tttt-123456789abc"
       VAULT_TOKEN_CHECK_INTERVAL: "30s"
       INJECTOR_POLL_INTERVAL: "30s"
       INJECTOR_LOG_LEVEL: "info"
+
+      # File credentials are re-read before every AppRole login. This supports
+      # rotation without restarting the injector when the mounted files are mutable.
+      # Docker Swarm Secrets themselves are immutable and require a service update
+      # with a newly created secret.
+      VAULT_APPROLE_ROLE_ID_FILE: "/run/secrets/vault_approle_role_id"
+      VAULT_APPROLE_SECRET_ID_FILE: "/run/secrets/vault_approle_secret_id"
+
+    # # If mounted from filesystem, files can be updated without restarting injector service
+    #   VAULT_APPROLE_ROLE_ID_FILE: "/vault-auth/role-id"
+    #   VAULT_APPROLE_SECRET_ID_FILE: "/vault-auth/secret-id"
+    # volumes:
+    #   - /opt/docker-vault-injector/auth:/vault-auth:ro
+
     secrets:
       - vault_approle_role_id
       - vault_approle_secret_id
