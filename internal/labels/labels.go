@@ -24,17 +24,25 @@ const (
 	Prefix = "io.github.docker-vault-injector"
 
 	EnabledLabel         = Prefix + ".enabled"
+	BootstrapGateLabel   = Prefix + ".bootstrap-gate"
 	SecretsPrefix        = Prefix + ".secrets."
 	AppliedVersionsLabel = Prefix + ".applied-versions"
 	ManagedEnvLabel      = Prefix + ".managed-env"
 	StateHashLabel       = Prefix + ".state-hash"
 	ConfigHashLabel      = Prefix + ".config-hash"
+
+	// BootstrapGateConstraint is an intentionally unsatisfiable placement
+	// constraint. Operators must never add the matching label to a Swarm node.
+	// When bootstrap-gate is enabled, the controller removes this exact
+	// constraint in the same ServiceUpdate that installs the Vault environment.
+	BootstrapGateConstraint = "node.labels." + Prefix + ".gate==open"
 )
 
 // Config is the user-controlled portion of the service configuration.
 type Config struct {
-	Enabled bool
-	Secrets map[string]SecretSource
+	Enabled       bool
+	BootstrapGate bool
+	Secrets       map[string]SecretSource
 }
 
 // SecretSource describes one Vault KV v2 document. An empty Env map means
@@ -65,6 +73,14 @@ func ParseConfig(serviceLabels map[string]string) (Config, error) {
 	result.Enabled = enabled
 	if !enabled {
 		return result, nil
+	}
+
+	if rawBootstrapGate, exists := serviceLabels[BootstrapGateLabel]; exists {
+		bootstrapGate, err := strconv.ParseBool(rawBootstrapGate)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be true or false: %w", BootstrapGateLabel, err)
+		}
+		result.BootstrapGate = bootstrapGate
 	}
 
 	result.Secrets = make(map[string]SecretSource)
@@ -146,9 +162,19 @@ func ParseConfig(serviceLabels map[string]string) (Config, error) {
 // ConfigHash detects changes to mount, path, source name or explicit mapping
 // even when the old and new Vault documents happen to have the same version.
 func ConfigHash(configuration Config) (string, error) {
-	encoded, err := json.Marshal(configuration.Secrets)
+	// Enabled is deliberately omitted: ConfigHash is only calculated for an
+	// enabled service. BootstrapGate is included because turning the safety
+	// contract on or off is a material configuration change.
+	hashInput := struct {
+		BootstrapGate bool                    `json:"bootstrap_gate"`
+		Secrets       map[string]SecretSource `json:"secrets"`
+	}{
+		BootstrapGate: configuration.BootstrapGate,
+		Secrets:       configuration.Secrets,
+	}
+	encoded, err := json.Marshal(hashInput)
 	if err != nil {
-		return "", fmt.Errorf("marshal secret source configuration: %w", err)
+		return "", fmt.Errorf("marshal injector configuration: %w", err)
 	}
 	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:]), nil

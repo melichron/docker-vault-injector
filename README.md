@@ -22,6 +22,7 @@ This is a straightforward, functional MVP rather than a finished production rele
 - automatic import of flat Vault documents without listing individual variables;
 - optional explicit mappings, including nested fields such as `connection.host`;
 - environment variable collision detection across sources;
+- an opt-in bootstrap gate that prevents tasks from starting before their first successful injection;
 - optimistic locking through Docker `Version.Index`;
 - preservation of all `ServiceSpec` fields not owned by the controller;
 - detection of manual changes to injected environment variables;
@@ -124,6 +125,44 @@ deploy:
 The suffix after `.env.` is the target Docker environment variable name, while the label value is the path to a field in the Vault document. The controller does not impose shell naming conventions; operators are responsible for deciding whether unusual names are appropriate. Only empty names and names containing `=` are rejected because Docker stores entries as `NAME=value`.
 
 An environment variable may be owned by only one source, including variables discovered through automatic import. A collision rejects the entire reconciliation before the service is changed. Environment values may be strings, numbers, or booleans. Automatic import rejects top-level objects, arrays, and `null`; a nested scalar can instead be selected with an explicit mapping.
+
+## Bootstrap gate
+
+Docker Swarm has no admission hook that lets an event-driven controller mutate a service before the scheduler sees it. A service created normally may therefore start one or more tasks before the injector reacts to its create event.
+
+Initialization-sensitive services can opt into a fail-closed scheduling gate:
+
+```yaml
+deploy:
+  placement:
+    constraints:
+      # Ordinary constraints remain untouched.
+      - node.role==worker
+      - node.labels.region==eu-central
+
+      # Reserved injector gate. Never add the matching label to a node.
+      - node.labels.io.github.docker-vault-injector.gate==open
+  labels:
+    io.github.docker-vault-injector.enabled: "true"
+    io.github.docker-vault-injector.bootstrap-gate: "true"
+    io.github.docker-vault-injector.secrets.application.name: "application"
+    io.github.docker-vault-injector.secrets.application.kv: "kv"
+    io.github.docker-vault-injector.secrets.application.vault-path: "apps/application"
+```
+
+No Swarm node should ever have this label:
+
+```text
+io.github.docker-vault-injector.gate=open
+```
+
+The unsatisfied equality constraint keeps tasks in `Pending`. After every Vault source has been read and validated, the controller writes the environment and removes only the reserved constraint in the same optimistic `ServiceUpdate`. The scheduler can then start tasks from the injected service revision. Operator-owned constraints and replica settings are preserved.
+
+If Vault is unavailable, a field is invalid, or two sources collide, the controller performs no update and the gate remains closed. Enabling `bootstrap-gate` without placing the reserved constraint in the initial or configuration-changing service specification is an error; the label by itself cannot stop the scheduler.
+
+Keep both the label and reserved constraint in the stack file for as long as the service depends on injection. The live ServiceSpec intentionally has the gate removed, while a later `docker stack deploy` reapplies a specification that restores the gate and omits the controller-generated environment. The injector then performs another gated reconciliation. Removing the gate from the stack reintroduces the create/update race.
+
+See [examples/postgres-stack.yaml](examples/postgres-stack.yaml) for a complete initialization-sensitive example.
 
 The controller adds these state labels itself:
 
@@ -289,6 +328,23 @@ vault kv patch -mount=kv apps/example/database DB_PASSWORD=new-password
 
 the controller notices the new `current_version`, changes the environment, and Swarm replaces the service task.
 
+The Postgres bootstrap-gate example expects a flat Vault document:
+
+```bash
+vault kv put -mount=kv apps/example/postgres \
+  POSTGRES_USER=example \
+  POSTGRES_PASSWORD=change-me \
+  POSTGRES_DB=example
+```
+
+Deploy it with:
+
+```bash
+docker stack deploy -c examples/postgres-stack.yaml vault-postgres-demo
+```
+
+While the service is waiting for injection, `docker service ps vault-postgres-demo_postgres` reports that no node satisfies the reserved constraint. After successful injection, the gate disappears from the live service, Postgres starts with all three initialization variables, and its named volume retains the initialized database.
+
 ## Error behavior
 
 The project's fail-safe rule is: **never replace working values with empty values because of a Vault or configuration error**.
@@ -301,7 +357,7 @@ If another process changes the service between `ServiceInspect` and `ServiceUpda
 
 Running `docker stack deploy` again may remove environment variables and state labels added by the controller because they are not present in the original stack YAML. The injector restores them after the service update event. This may cause a second rolling update immediately after the rollout initiated by `docker stack deploy`.
 
-This eventual-consistency behavior is acceptable for the MVP. Guaranteeing exactly one rollout would require a separate deployment wrapper or preprocessor, which is outside this project's scope.
+Without a bootstrap gate, this is eventual consistency: a new task may start before reinjection. With a correctly configured bootstrap gate, uninjected task revisions remain unschedulable and the injector removes the gate only together with the restored environment. Depending on the service's `update_config.order`, this safety may trade availability for correctness while Vault is unavailable. Guaranteeing exactly one rollout would require a separate deployment wrapper or preprocessor, which is outside this project's scope.
 
 ## Security
 

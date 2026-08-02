@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"slices"
@@ -41,12 +42,16 @@ func (d *fakeDocker) WatchServiceEvents(context.Context) (<-chan events.Message,
 }
 
 type fakeVault struct {
-	versions map[string]int
-	secrets  map[string]vaultclient.Secret
-	reads    int
+	versions            map[string]int
+	secrets             map[string]vaultclient.Secret
+	currentVersionError error
+	reads               int
 }
 
 func (v *fakeVault) CurrentVersion(_ context.Context, mount, path string) (int, error) {
+	if v.currentVersionError != nil {
+		return 0, v.currentVersionError
+	}
 	return v.versions[mount+"/"+path], nil
 }
 
@@ -130,6 +135,153 @@ func TestReconcileRepairsEnvironmentDriftWithoutVersionChange(t *testing.T) {
 	}
 }
 
+func TestBootstrapGateIsRemovedAtomicallyWithEnvironmentInjection(t *testing.T) {
+	docker := &fakeDocker{}
+	vault := &fakeVault{
+		versions: map[string]int{"kv/apps/api": 7},
+		secrets: map[string]vaultclient.Secret{
+			"kv/apps/api": {Version: 7, Data: map[string]any{
+				"username": "api-user",
+				"database": map[string]any{"password": "correct horse"},
+			}},
+		},
+	}
+	service := managedService()
+	service.Spec.Labels[labels.BootstrapGateLabel] = "true"
+	service.Spec.TaskTemplate.Placement = &swarm.Placement{Constraints: []string{
+		"node.role==manager",
+		"node.labels.io.github.docker-vault-injector.gate == open",
+	}}
+
+	if err := testController(docker, vault).ReconcileService(context.Background(), service); err != nil {
+		t.Fatal(err)
+	}
+	if len(docker.updates) != 1 {
+		t.Fatalf("updates = %d, want 1", len(docker.updates))
+	}
+	updated := docker.updates[0]
+	if hasBootstrapGate(updated) {
+		t.Fatal("the successful update must remove the reserved bootstrap gate")
+	}
+	wantConstraints := []string{"node.role==manager"}
+	if got := updated.Spec.TaskTemplate.Placement.Constraints; !slices.Equal(got, wantConstraints) {
+		t.Fatalf("constraints = %v, want %v", got, wantConstraints)
+	}
+	if !hasBootstrapGate(service) {
+		t.Fatal("reconciliation mutated the inspected service instead of its clone")
+	}
+	if got := updated.Spec.TaskTemplate.ContainerSpec.Env; !slices.Contains(got, "DB_PASSWORD=correct horse") {
+		t.Fatalf("gate was removed without the desired environment: %v", got)
+	}
+
+	if err := testController(docker, vault).ReconcileService(context.Background(), updated); err != nil {
+		t.Fatalf("reconcile after opening the gate failed: %v", err)
+	}
+	if len(docker.updates) != 1 {
+		t.Fatal("the opened, current service caused an unnecessary update")
+	}
+
+	vault.versions["kv/apps/api"] = 8
+	vault.secrets["kv/apps/api"] = vaultclient.Secret{Version: 8, Data: map[string]any{
+		"username": "rotated-user",
+		"database": map[string]any{"password": "rotated password"},
+	}}
+	if err := testController(docker, vault).ReconcileService(context.Background(), updated); err != nil {
+		t.Fatalf("ordinary Vault rotation after opening the gate failed: %v", err)
+	}
+	if len(docker.updates) != 2 {
+		t.Fatalf("Vault rotation updates = %d, want 2 total", len(docker.updates))
+	}
+	if hasBootstrapGate(docker.updates[1]) {
+		t.Fatal("ordinary Vault rotation must not restore the bootstrap gate")
+	}
+}
+
+func TestBootstrapGateFailsClosedWhenVaultIsUnavailable(t *testing.T) {
+	docker := &fakeDocker{}
+	vault := &fakeVault{currentVersionError: errors.New("Vault unavailable")}
+	service := managedService()
+	service.Spec.Labels[labels.BootstrapGateLabel] = "true"
+	service.Spec.TaskTemplate.Placement = &swarm.Placement{Constraints: []string{
+		labels.BootstrapGateConstraint,
+	}}
+
+	err := testController(docker, vault).ReconcileService(context.Background(), service)
+	if err == nil {
+		t.Fatal("Vault failure should fail reconciliation")
+	}
+	if len(docker.updates) != 0 {
+		t.Fatal("Vault failure must not remove the gate or update the service")
+	}
+	if !hasBootstrapGate(service) {
+		t.Fatal("Vault failure removed the gate from the inspected service")
+	}
+}
+
+func TestBootstrapGateRequiresReservedConstraintBeforeFirstInjection(t *testing.T) {
+	docker := &fakeDocker{}
+	vault := &fakeVault{}
+	service := managedService()
+	service.Spec.Labels[labels.BootstrapGateLabel] = "true"
+
+	err := testController(docker, vault).ReconcileService(context.Background(), service)
+	if err == nil {
+		t.Fatal("bootstrap-gate without its placement constraint should fail")
+	}
+	if len(docker.updates) != 0 {
+		t.Fatal("misconfigured bootstrap gate must not update the service")
+	}
+}
+
+func TestBootstrapGateRequiresConstraintWhenConfigurationChanges(t *testing.T) {
+	docker := &fakeDocker{}
+	vault := &fakeVault{
+		versions: map[string]int{"kv/apps/api": 7},
+		secrets: map[string]vaultclient.Secret{
+			"kv/apps/api": {Version: 7, Data: map[string]any{
+				"username": "api-user",
+				"database": map[string]any{"password": "correct horse"},
+			}},
+		},
+	}
+	service := managedService()
+	service.Spec.Labels[labels.BootstrapGateLabel] = "true"
+	service.Spec.TaskTemplate.Placement = &swarm.Placement{Constraints: []string{
+		labels.BootstrapGateConstraint,
+	}}
+	controller := testController(docker, vault)
+
+	if err := controller.ReconcileService(context.Background(), service); err != nil {
+		t.Fatal(err)
+	}
+	updated := docker.updates[0]
+	updated.Spec.Labels[labels.SecretsPrefix+"database.vault-path"] = "apps/changed"
+
+	err := controller.ReconcileService(context.Background(), updated)
+	if err == nil {
+		t.Fatal("a gated configuration change without a restored constraint should fail")
+	}
+	if len(docker.updates) != 1 {
+		t.Fatal("unsafe configuration change must not update the service")
+	}
+}
+
+func TestReservedConstraintRequiresBootstrapGateLabel(t *testing.T) {
+	docker := &fakeDocker{}
+	service := managedService()
+	service.Spec.TaskTemplate.Placement = &swarm.Placement{Constraints: []string{
+		labels.BootstrapGateConstraint,
+	}}
+
+	err := testController(docker, &fakeVault{}).ReconcileService(context.Background(), service)
+	if err == nil {
+		t.Fatal("the reserved constraint must not be removed without explicit opt-in")
+	}
+	if len(docker.updates) != 0 {
+		t.Fatal("reserved constraint without opt-in must remain untouched")
+	}
+}
+
 func TestDisableRemovesOnlyManagedEnvironment(t *testing.T) {
 	docker := &fakeDocker{}
 	vault := &fakeVault{}
@@ -140,6 +292,9 @@ func TestDisableRemovesOnlyManagedEnvironment(t *testing.T) {
 	service.Spec.Labels[labels.AppliedVersionsLabel] = `{"database":7}`
 	service.Spec.Labels[labels.StateHashLabel] = "hash"
 	service.Spec.Labels[labels.ConfigHashLabel] = "config-hash"
+	service.Spec.TaskTemplate.Placement = &swarm.Placement{Constraints: []string{
+		labels.BootstrapGateConstraint,
+	}}
 	service.Spec.TaskTemplate.ContainerSpec.Env = []string{
 		"LOG_LEVEL=info", "DB_PASSWORD=secret", "DB_USER=user",
 	}
@@ -163,6 +318,9 @@ func TestDisableRemovesOnlyManagedEnvironment(t *testing.T) {
 		if _, exists := updated.Spec.Labels[key]; exists {
 			t.Fatalf("controller state label %s was not removed", key)
 		}
+	}
+	if !hasBootstrapGate(updated) {
+		t.Fatal("disabling injection must not remove a bootstrap gate")
 	}
 }
 

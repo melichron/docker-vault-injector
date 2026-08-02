@@ -35,12 +35,15 @@ The project intentionally does not support standalone Docker containers. A singl
 14. Token lifecycle must retain proactive `lookup-self`, renewal before TTL, and re-login after revoke/expiry/renewal failure.
 15. Do not enforce shell-style environment naming conventions. Reject only names that Docker's `NAME=value` representation cannot encode unambiguously: empty names and names containing `=`.
 16. A collision between automatically imported and/or explicitly mapped environment names must abort reconciliation before `ServiceUpdate`.
+17. When bootstrap gating is enabled, remove the reserved placement constraint only in the same `ServiceUpdate` that writes a fully resolved environment and controller state.
+18. Any Vault, parsing, mapping, collision, or Docker error must leave the bootstrap gate closed. Never alter operator-owned placement constraints.
 
 ## Public label contract
 
 User-controlled:
 
 - `io.github.docker-vault-injector.enabled`
+- `io.github.docker-vault-injector.bootstrap-gate` (optional boolean)
 - `io.github.docker-vault-injector.secrets.<source>.name`
 - `io.github.docker-vault-injector.secrets.<source>.kv`
 - `io.github.docker-vault-injector.secrets.<source>.vault-path`
@@ -59,6 +62,14 @@ Labels are grouped by the arbitrary `<source>` segment. `name`, `kv`, and `vault
 
 With no `.env.*` labels for a source, import every top-level scalar Vault field using the field name unchanged. If one or more `.env.*` labels exist, import only those mappings; the suffix is the target environment name and the label value is a dotted Vault field path. Objects, arrays, and null are never encoded into environment values.
 
+Bootstrap-gated services must include this exact placement constraint in the stack specification:
+
+```text
+node.labels.io.github.docker-vault-injector.gate==open
+```
+
+No node may carry the matching `io.github.docker-vault-injector.gate=open` label. The controller owns only this exact reserved constraint. It preserves every other constraint, removes the gate atomically with successful injection, and never removes it while injection is disabled or failing. The gate and `bootstrap-gate=true` should remain in the stack file so every subsequent `docker stack deploy` is gated as well.
+
 The old multiline `io.github.docker-vault-injector.secrets` JSON label is not supported. This is currently a pre-release project, so the flat schema intentionally replaced it instead of adding a compatibility parser. Any future schema change is a public API change and needs an explicit migration story.
 
 ## Reconciliation algorithm
@@ -67,17 +78,18 @@ For an enabled service:
 
 1. Parse and validate labels.
 2. Parse controller-owned applied versions, managed names, state hash, and config hash.
-3. Read `current_version` metadata for every configured source.
-4. Compare versions, configuration hash, and the hash of current previously-managed environment values.
-5. If all match, return without reading Vault data or updating Docker.
-6. Otherwise read the exact current version of every source.
-7. Auto-import all top-level scalar fields for sources without mappings; otherwise resolve the explicit dotted field paths.
-8. Reject null/object/array values and reject duplicate environment ownership across every source.
-9. Remove previously managed keys, preserve unrelated environment entries, append desired keys in sorted order.
-10. Update controller state labels.
-11. Call one `ServiceUpdate` with the version from the inspected service.
+3. Detect the reserved bootstrap constraint. Reject it without explicit opt-in, and reject a new or changed gated configuration that omitted it.
+4. Read `current_version` metadata for every configured source.
+5. Compare versions, configuration hash, the hash of current previously-managed environment values, and gate state.
+6. If all match and no gate remains, return without reading Vault data or updating Docker.
+7. Otherwise read the exact current version of every source.
+8. Auto-import all top-level scalar fields for sources without mappings; otherwise resolve the explicit dotted field paths.
+9. Reject null/object/array values and reject duplicate environment ownership across every source.
+10. Remove previously managed keys, preserve unrelated environment entries, append desired keys in sorted order.
+11. Update controller state labels and, when enabled, remove only the reserved gate constraint.
+12. Call one `ServiceUpdate` with the version from the inspected service.
 
-For a disabled service with controller state, remove previously managed environment keys and controller state labels. Keep the user's `enabled=false` label.
+For a disabled service with controller state, remove previously managed environment keys and controller state labels. Keep the user's `enabled=false` label and never remove a bootstrap constraint while disabled.
 
 ## Code map
 
@@ -122,6 +134,7 @@ The module path `github.com/vyktory/docker-vault-injector` is provisional becaus
 - AppRole uses reusable RoleID/SecretID credentials; response-wrapped SecretID delivery is not implemented yet.
 - One controller replica is expected. Multiple replicas are mostly protected by Docker optimistic locking but can cause noisy conflicts; implement leader election before recommending HA replicas.
 - Reapplying a stack file can cause one rollout from `docker stack deploy` and a second rollout from reinjection.
+- Bootstrap gating prevents uninjected task revisions only when the incoming stack/service specification contains the reserved constraint. The label alone cannot intercept the Swarm scheduler.
 - There is no Prometheus metrics or HTTP health endpoint.
 - Docker warnings returned after successful ServiceUpdate are currently ignored by the thin adapter.
 - Full end-to-end tests against a real single-node Swarm and Vault dev server are not present.
