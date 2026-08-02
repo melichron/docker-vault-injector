@@ -21,6 +21,8 @@ RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
     -o /out/docker-vault-injector ./cmd/docker-vault-injector
 
 FROM scratch
+LABEL org.opencontainers.image.source="https://github.com/melichron/docker-vault-injector"
+LABEL org.opencontainers.image.description="Inject HashiCorp Vault KV secrets into Docker Swarm service environments"
 ENV PATH=/bin
 
 # Vault should use HTTPS in production. The CA bundle is needed for public CAs;
