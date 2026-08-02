@@ -1,8 +1,8 @@
-# Создание Vault policy и AppRole
+# Creating a Vault policy and AppRole
 
-Этот пример создаёт отдельный AppRole для `docker-vault-injector`, смонтированный в нестандартном path `auth/docker-swarm`. Injector должен получить именно полный mount path `auth/docker-swarm`, но без `/login`.
+This example creates a dedicated AppRole for `docker-vault-injector` using the custom auth mount `auth/docker-swarm`. The injector must be configured with the full mount path `auth/docker-swarm`, without the `/login` suffix.
 
-Команды выполняются Vault-оператором с правами на создание auth methods, policies и AppRole. Значения можно изменить под свою инфраструктуру:
+Run these commands as a Vault operator with permission to create auth methods, policies, and AppRoles. Adjust the values to match your infrastructure:
 
 ```bash
 export VAULT_ADDR=https://vault.example.com:8200
@@ -11,37 +11,37 @@ export ROLE_NAME=docker-vault-injector
 export POLICY_NAME=docker-vault-injector
 ```
 
-В `AUTH_PATH` для Vault CLI указывается имя mount без префикса `auth/`. В конфигурации injector тот же mount будет записан как `VAULT_APPROLE_AUTH_PATH=auth/docker-swarm`.
+For the Vault CLI, `AUTH_PATH` contains the mount name without the `auth/` prefix. The same mount is configured in the injector as `VAULT_APPROLE_AUTH_PATH=auth/docker-swarm`.
 
-## 1. Включить AppRole auth method
+## 1. Enable the AppRole auth method
 
 ```bash
 vault auth enable -path="$AUTH_PATH" approle
 ```
 
-Если auth method уже существует, этот шаг выполнять повторно не нужно. Проверить mounts можно командой:
+Skip this step if the auth method already exists. To list the existing auth mounts, run:
 
 ```bash
 vault auth list
 ```
 
-## 2. Создать policy
+## 2. Create the policy
 
-Готовый файл находится рядом: [vault-policy.hcl](vault-policy.hcl).
+A ready-to-use policy file is provided alongside this document: [vault-policy.hcl](vault-policy.hcl).
 
 ```bash
 vault policy write "$POLICY_NAME" examples/vault-policy.hcl
 ```
 
-Policy разрешает:
+The policy permits the injector to:
 
-- читать metadata и data под `kv/apps/*`;
-- проверять текущий token через `auth/token/lookup-self`;
-- продлевать token через `auth/token/renew-self`.
+- read KV metadata and data under `kv/apps/*`;
+- inspect its current token through `auth/token/lookup-self`;
+- renew its token through `auth/token/renew-self`.
 
-Если KV v2 смонтирован не в `kv` или секреты лежат вне `apps/*`, измените оба KV path в policy.
+If the KV v2 engine is mounted somewhere other than `kv`, or the secrets are stored outside `apps/*`, update both KV paths in the policy.
 
-## 3. Создать AppRole
+## 3. Create the AppRole
 
 ```bash
 vault write "auth/$AUTH_PATH/role/$ROLE_NAME" \
@@ -54,17 +54,17 @@ vault write "auth/$AUTH_PATH/role/$ROLE_NAME" \
   secret_id_ttl=0
 ```
 
-Здесь намеренно используется periodic service token:
+This example deliberately uses a periodic service token:
 
-- `token_period=20m` выдаёт renewable token с TTL 20 минут;
-- injector проверяет его состояние и продлевает примерно на 2/3 TTL;
-- если token revoked или renewal не удался, injector снова выполняет AppRole login;
-- `secret_id_num_uses=0` позволяет повторный login с тем же SecretID;
-- `secret_id_ttl=0` не даёт SecretID истечь самостоятельно.
+- `token_period=20m` issues a renewable token with a 20-minute TTL;
+- the injector checks the token status and renews it after approximately two-thirds of its TTL;
+- if the token is revoked or renewal fails, the injector performs another AppRole login;
+- `secret_id_num_uses=0` allows repeated logins with the same SecretID;
+- `secret_id_ttl=0` prevents the SecretID from expiring on its own.
 
-Бессрочный и многократно используемый SecretID удобен для начальной эксплуатации, но является долгоживущим credential. Его следует хранить как Docker Secret, ограничить policy минимально необходимыми paths и периодически ротировать. Более строгая схема может использовать короткоживущий wrapped SecretID, но тогда нужен отдельный механизм его доставки и обновления.
+A non-expiring, reusable SecretID is convenient for initial operation, but it is a long-lived credential. Store it as a Docker Secret, restrict the policy to the minimum required paths, and rotate it periodically. A stricter deployment can use a short-lived response-wrapped SecretID, but that requires a separate delivery and refresh mechanism.
 
-## 4. Получить RoleID и SecretID
+## 4. Obtain the RoleID and SecretID
 
 ```bash
 vault read -field=role_id \
@@ -76,27 +76,27 @@ vault write -field=secret_id -f \
   > secret-id.txt
 ```
 
-Не выводите SecretID в CI logs. Локальные файлы после создания Docker Secrets следует безопасно удалить.
+Never print the SecretID in CI logs. Securely remove the local files after creating the Docker Secrets.
 
-## 5. Передать credentials в Docker Swarm
+## 5. Provide the credentials to Docker Swarm
 
 ```bash
 docker secret create vault_approle_role_id role-id.txt
 docker secret create vault_approle_secret_id secret-id.txt
 ```
 
-После этого используйте [stack.yaml](stack.yaml), где credentials монтируются как:
+Then use [stack.yaml](stack.yaml), where the credentials are mounted at:
 
 ```text
 /run/secrets/vault_approle_role_id
 /run/secrets/vault_approle_secret_id
 ```
 
-Injector перечитывает оба файла при каждом новом AppRole login. Для ротации Docker Secrets создайте новые версионированные secrets и перемонтируйте их под теми же target paths.
+The injector re-reads both files before every new AppRole login. To rotate Docker Secrets, create new versioned secrets and mount them at the same target paths.
 
-## 6. Проверить AppRole вручную
+## 6. Test the AppRole manually
 
-Для диагностической проверки можно выполнить login вручную:
+For diagnostic purposes, perform a login manually:
 
 ```bash
 vault write "auth/$AUTH_PATH/login" \
@@ -104,4 +104,4 @@ vault write "auth/$AUTH_PATH/login" \
   secret_id="$(tr -d '\n' < secret-id.txt)"
 ```
 
-В ответе должны присутствовать `token_duration`, равный примерно `20m`, и `token_renewable=true`.
+The response should contain a `token_duration` of approximately `20m` and `token_renewable=true`.
